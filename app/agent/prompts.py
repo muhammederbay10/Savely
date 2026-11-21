@@ -17,7 +17,9 @@ from typing import Final
 # The placeholders each template must contain, exactly. Fields not listed take none.
 _PLACEHOLDERS: Final[dict[str, frozenset[str]]] = {
     "system": frozenset({"max_results"}),
-    "working_set": frozenset({"items"}),
+    "profile": frozenset({"home_area"}),
+    "working_set": frozenset({"items", "shown"}),
+    "working_set_searches": frozenset({"searches"}),
     "answer_too_long": frozenset({"max_bytes"}),
 }
 
@@ -30,8 +32,14 @@ class AgentPrompts:
         version: Names this wording, e.g. `2026-11-20.1`.
         system: Who the agent is and how it answers; `{max_results}` is the
             most results one answer shows.
+        profile: What the user told about themselves; `{home_area}` is where
+            they live.
         working_set: Introduces the results the user saw last, by number;
-            `{items}` is the numbered list of their ids.
+            `{items}` is the numbered list of their ids and `{shown}` how many
+            of them were sent.
+        working_set_searches: Introduces the searches those results came
+            from; `{searches}` is one line per search: the tool and its
+            arguments as JSON.
         invalid_answer: Sent back when the final answer does not follow its format.
         unknown_items: Sent back when the answer lists items no tool returned.
         missing_notice: Sent back when the answer leaves out a required notice.
@@ -43,7 +51,9 @@ class AgentPrompts:
 
     version: str
     system: str
+    profile: str
     working_set: str
+    working_set_searches: str
     invalid_answer: str
     unknown_items: str
     missing_notice: str
@@ -83,10 +93,11 @@ def _placeholders(field_name: str, template: str) -> frozenset[str]:
     return frozenset(names)
 
 
-# Approved for now by Muhammed on 2026-11-20 (record 0015, Q3); scored on the eval set
-# when SAV-19/20 exist. Change the version with any change to the wording.
+# Version 2026-11-20.3 was approved for now by Muhammed on 2026-11-20 (record 0015, Q3).
+# 2026-11-21.1 adds short-term memory and the profile (SAV-18). Both are scored on the
+# eval set when SAV-19/20 exist. Change the version with any change to the wording.
 AGENT_PROMPTS: Final = AgentPrompts(
-    version="2026-11-20.3",
+    version="2026-11-21.1",
     system=(
         "You are Savely, a chat assistant for the posts this user saved. You answer only "
         "from their own saves, and only through the tools: never invent an item, a place, a "
@@ -106,6 +117,13 @@ AGENT_PROMPTS: Final = AgentPrompts(
         "than asked. may_be_incomplete: some results may be missing. Otherwise `notice` "
         "is null.\n"
         "- When a tool asks for the user's country, ask the user for it; never guess it.\n"
+        "- When the user tells you where they live or which country they are in, call "
+        "set_profile. If a question needs their home area or country and you don't know "
+        "it, ask once; if they don't answer, don't ask again.\n"
+        "- Follow-ups refer to the user's last results. 'The second one' is number 2 of "
+        "them. 'Show more' lists the next ones that were not shown yet. To narrow or change "
+        "them ('only the cheap ones', 'which of those are on Netflix?'), call the search "
+        "they came from again with the same arguments plus the change.\n"
         "- A correction ('no, it's a travel video') changes only the one item the user "
         "means, with update_item. 'Watched', 'visited', 'read' and 'done' are status "
         "done; 'want to' is status want.\n"
@@ -115,7 +133,14 @@ AGENT_PROMPTS: Final = AgentPrompts(
         "question the bot just asked; otherwise never call it. If it refuses, nothing was "
         "deleted: tell the user so in one sentence."
     ),
-    working_set="The results the user saw last, by number:\n{items}",
+    profile="The user lives in: {home_area}. Use it when they mean their home area.",
+    working_set=(
+        "The results the user saw last, by number. The first {shown} were shown to them; "
+        "any after those are for 'show more':\n{items}"
+    ),
+    working_set_searches=(
+        "Those results came from these searches (tool, then its arguments):\n{searches}"
+    ),
     invalid_answer=(
         "Your answer did not follow the answer format. Answer again with `language`, "
         "`reply`, `notice` and `item_ids` only."

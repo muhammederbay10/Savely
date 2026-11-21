@@ -227,6 +227,7 @@ flowchart TD
 | `get_item(item_id)` | Full details: open values with their paths, entity info and links, original post link, streaming in the user's country |
 | `update_item(item_id, path, value)` | Fix one open value ("it's a travel video"). Changes only this item and never adds a synonym (§3.4). Re-resolving an entity ("no, it's the Bebek branch") and notes come with the resolvers (SAV-15) |
 | `set_status(item_id, status, entity_position?)` | Mark the item's place or title as visited / watched / read / done, or "want to" (`USER_ENTITY.status`); `entity_position` picks one of a list post's entities. An item with no entity (e.g. a study post) keeps its status on the item itself (`SAVED_ITEM.user_status`), deleted with it (record 0015, Q6) |
+| `set_profile(home_area?, country?)` | Keeps where the user lives and their country when they tell it ("I live in Beşiktaş"), on the `USER` row; the model asks once when a question needs one it doesn't know (record 0016) |
 | `resolve_choice(item_id, option)` | Handles the user's answer to a "which one?" question (with SAV-15's pending choices) |
 | `request_data_deletion()` | "Delete my data", in any words or language: the answer becomes a fixed confirmation question in the user's language. The request becomes confirmable only once that question was delivered, until `DATA_DELETION_CONFIRM_SECONDS` later |
 | `confirm_data_deletion()` | Deletes everything of the sender only when all of these hold, enforced in code: a delivered question, this is the **next** message (the request is taken out at the start of every turn, so "no" or any other message cancels it), the message is a tap on the question's **"Yes, delete" button** (its fixed quick-reply payload, which the adapter reads and the chat worker turns into `deletion_confirmed`; a typed "yes" shows the question again), and the deadline, checked right before erasing and again by the eraser once it holds the user's row lock, which it may have to wait for. A successful erasure ends the turn with the fixed "done" DM, prepared in the user's language before, sent to the platform id read before the deletion |
@@ -273,6 +274,10 @@ The agent has three kinds of memory:
 **Short-term memory** makes follow-ups work:
 - The last ~20 messages go into the response agent's context.
 - The **working set** is the last result list with numbers and the filters that produced it. That lets "the second one", "show more", "only the cheap ones" or "which of those are on Netflix?" refine the previous search instead of starting over.
+
+How it is built (`app/memory/session.py`, decision record [0016](decisions/0016-short-term-memory-and-chat-worker.md)): three Redis keys per user (the history, the working set, and marks of answers whose sending started), all expiring `SESSION_TTL_SECONDS` after the last exchange. The working set holds the result ids in their numbered order, how many were shown, and each search behind them as its tool and arguments. The model sees the numbered list, which ones were not shown yet, and the searches; to narrow, it repeats the search with one more filter. An answer that lists no items keeps the last working set. The chat worker (`app/agent/worker.py`, `app/agent/chat.py`) loads all this before the response agent runs and stores the new exchange after the answer was sent, also as rows of `CONVERSATION_MSG`.
+
+The **basic profile** is the `USER` row: `home_area` and `country` are set by the agent's `set_profile` tool when the user tells them, and `language` is the language of the user's last message, stored by the chat worker (the save confirmations use it). The home area is shown to the agent on every turn.
 
 **Long-term memory: extract → gate → consolidate → retrieve** (Mem0-style). This runs **asynchronously after each reply**, so it never slows the chat.
 
@@ -369,7 +374,7 @@ erDiagram
 - **`ENRICHMENT_RUN`** has one row per step of an item (`fetch`, `classify`, `transcribe`, `extract`, `normalize`, `embed`, `confirm`), with `status` `done`, `failed` or `skipped`. A failed step keeps an `error` with no content in it. The normalize step's `output` records, per path, the vocabulary field, the outcome (`exact_value`, `exact_alias`, `matched`, `new`, `private` or `undecided`), the value and alias it went through, and the match probability.
 - **`VOCABULARY`** holds one canonical value per `field` (category, tag, cuisine, genre, subject, exam…) in English lower case, with an `embedding` for matching new wordings; `(field, value)` is unique. It's shared by all users, grows from real saves, and holds only wording that passed the privacy gate (§3.4).
 - **`VOCABULARY_ALIAS`** holds other wordings of a value, in any language, each with a `status`: `candidate` (one decision-model match), `verified` (confirmed, used for exact hits) or `rejected` (a wrong match, never used again). `probability` is the best match confidence seen, and `correction_count` counts user corrections against it. Which items matched through an alias is recorded in their `ENRICHMENT_RUN` normalize step, not here.
-- **"Delete my data"** goes through one eraser (`app/db/deletion.UserDataEraser`): first every store outside Postgres (ingestion's Redis state and queued jobs, a pending deletion request, stored media files), then the rows. If a store outside Postgres fails, Postgres is unchanged and the erasure can be repeated. Any new store of user data (short-term memory, SAV-18) joins this eraser. It removes the user's items with their `raw_values` and enrichment runs, and lowers each value's `item_count`. The vocabulary keeps only gated, generic wording with no link to any user. A value no item uses any more can be cleaned up.
+- **"Delete my data"** goes through one eraser (`app/db/deletion.UserDataEraser`): first every store outside Postgres (ingestion's Redis state and queued jobs, a pending deletion request, short-term memory, stored media files), then the rows. If a store outside Postgres fails, Postgres is unchanged and the erasure can be repeated. Any new store of user data joins this eraser, which the chat worker builds (`app.agent.worker.build_toolbox`). The profile fields and `CONVERSATION_MSG` rows go with the `USER` row. It removes the user's items with their `raw_values` and enrichment runs, and lowers each value's `item_count`. The vocabulary keeps only gated, generic wording with no link to any user. A value no item uses any more can be cleaned up.
 - Opening hours and ratings go out of date, so refresh `ENTITY.data` regularly (e.g. every 30 days), and also when the user asks for `open_now`. Streaming availability is refreshed per country (`ENTITY_AVAILABILITY`).
 - **Dedupe keys on `SAVED_ITEM`** (decision record 0007). A user's item is stored once per `(user_id, platform, platform_post_id)` and once per `(user_id, source_message_id)`, whichever of the two ids it has. `platform_post_id` and `post_url` may be empty: a reel saved into a collaborative collection has neither. Every item has at least a post id, a message id or a post link, and a missing value is never stored as empty text. The message-id key tells **messages apart, not reels**: the same reel saved through two messages (saved twice, or saved and also shared by DM) becomes two items, because nothing in the payloads links them.
 - Column-level choices (which columns may be empty, defaults, what is deleted with a user, index types) are in decision record 0007. The `MEMORY` table is created in Phase 2.
@@ -401,6 +406,7 @@ Savely/
       pipeline.py           # PipelineSettings
       retrieval.py          # RetrievalSettings
       agent.py              # AgentSettings
+      chat.py               # ChatSettings: the chat worker and short-term memory
     logging_config.py       # structured (JSON) logging setup
     adapters/
       base.py               # CaptureEvent and ChatMessage
@@ -472,6 +478,8 @@ Savely/
       prompts.py            # versioned wording for the text model
       deletion_requests.py  # pending "delete my data" requests (Redis), with their deadline
       send.py               # sends an answer; a delivered deletion question becomes confirmable
+      chat.py               # answers one chat message: memory in, agent, send, memory out
+      worker.py             # the chat worker (arq, chat queue) and the eraser of every store
       deep_look.py          # parallel subagents + write-back
       search/
         retrieval.py        # hybrid SQL + vector search, fallback ladder, time budget
@@ -487,6 +495,7 @@ Savely/
         answers.py          # an answer: the intro, then one reply per result, with fallbacks
     memory/
       session.py            # short-term: history + working set (Redis)
+      conversation.py       # the sender's profile and CONVERSATION_MSG (Postgres)
       longterm.py           # extract → gate → consolidate → retrieve
     db/
       models.py             # SQLAlchemy models for the tables in §4

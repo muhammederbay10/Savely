@@ -29,15 +29,16 @@ Items marked *(coming)* are planned for Phase 1 and not built yet.
 - **Any language.** Saves and questions can be in any language. Search matches what you type to the words in your own saves, so "Kore mutfağı" can find a save tagged "Korean food".
 - **Places in any country, with map links.** *(coming)* Each place is looked up on Google Maps, so you can search by city, district or neighbourhood, or near you.
 - **Movies and series, with where they stream.** *(coming)* Each title is looked up on TMDB, so you can ask what's on Netflix in your country.
+- **Follow-ups.** "The second one", "show more" and "only the cheap ones" work on your last answer for a day. Tell it "I live in Beşiktaş" once, and "near home" needs no question.
 - **Official APIs only.** Savely never asks for your Instagram password and never logs in as you.
-- **Delete your data any time.** "Delete my data" removes your saves, your messages and the media stored for you. *(coming: asking for it in the chat)*
+- **Delete your data any time.** "Delete my data" removes your saves, your messages and the media stored for you. Ask for it in the chat; it asks you to confirm with a button.
 
 ## How it works
 
 1. **Add Savely to a collection.** Create a new collection, turn on Collaborative, and add Savely. Instagram only allows this when a collection is created. Do the same for any other collections you want searchable.
 2. **Save as usual.** Every reel or post you save there is sent to Savely, video included. You can also share a single post to Savely by DM.
 3. **Savely indexes it once.** It works out what the post is, listens to the video when it has the file, picks out the details (a name, an area, a cuisine, a subject), and replies with how it was saved. This happens once, when you save, so asking later is fast.
-4. **Ask.** *(coming)* Ask in plain language, in any language:
+4. **Ask.** Ask in plain language, in any language:
    - "restaurants in Beşiktaş I saved"
    - "horror movies on Netflix I saved"
    - "Brooklyn'de kaydettiğim kafeler" (Turkish: "cafés I saved in Brooklyn")

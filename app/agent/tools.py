@@ -10,6 +10,7 @@ searching and the writing:
 | `get_item` | One item's details: what it is, where, links, streaming in the user's country |
 | `update_item` | Correct one open value of one item; it never creates a synonym |
 | `set_status` | Mark an item's place or title, or an item without one, as done or wanted |
+| `set_profile` | Keep where the user lives (home area) and their country, as they told it |
 | `request_data_deletion` | Start "delete my data": the bot asks the user to confirm |
 | `confirm_data_deletion` | Delete everything of the sender, only on an explicit confirmation |
 
@@ -37,6 +38,10 @@ A successful erasure ends the turn (`ToolOutcome.completion`): the "done"
 message was written in the user's language when the question was delivered, so
 no model or tool runs after the user is gone.
 
+**Searches are reported** with their arguments (`ToolOutcome.search`), so
+short-term memory (SAV-18) can keep the filters behind the last results and a
+follow-up such as "only the cheap ones" can repeat them with one more.
+
 **Arguments are checked** against each tool's schema, and search filters
 against the content type's declared filters (`plan_search`). A wrong argument
 comes back to the model as an error it can correct, never as a crash. The
@@ -47,13 +52,21 @@ import json
 import logging
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Annotated, Final, Literal
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, StringConstraints, ValidationError
-from sqlalchemy import select
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    ValidationError,
+    model_validator,
+)
+from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -81,6 +94,7 @@ from app.db.models import (
     ItemStatus,
     PlatformAccount,
     SavedItem,
+    User,
     UserEntity,
 )
 from app.db.types import GeoPoint
@@ -105,12 +119,17 @@ UPDATE_ITEM_TOOL: Final = "update_item"
 SET_STATUS_TOOL: Final = "set_status"
 REQUEST_DATA_DELETION_TOOL: Final = "request_data_deletion"
 CONFIRM_DATA_DELETION_TOOL: Final = "confirm_data_deletion"
+SET_PROFILE_TOOL: Final = "set_profile"
 
 _NOT_FOUND: Final = "The user has no saved item with that id."
 _ASK_USER_FOR: Final = "ask_user_for"
 _COUNTRY: Final = "country"
 
 NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+# ISO 3166-1 alpha-2, kept in upper case like `user.country` and the search's country.
+CountryCode = Annotated[
+    str, StringConstraints(strip_whitespace=True, to_upper=True, pattern=r"^[A-Za-z]{2}$")
+]
 
 
 class Notice(StrEnum):
@@ -140,6 +159,24 @@ class PlatformRecipient:
 
     platform: str
     platform_user_id: str = field(repr=False)
+
+
+@dataclass(frozen=True)
+class SearchUsed:
+    """One search the model ran: the tool and its checked arguments.
+
+    Short-term memory keeps the searches behind the last results (the working
+    set), and the agent shows them again on the next turn, so "only the cheap
+    ones" can repeat the search with one more filter.
+
+    Attributes:
+        tool: `search_items` or `near`.
+        arguments: The arguments as JSON values, without the ones left at
+            their defaults. They hold the user's own words.
+    """
+
+    tool: str
+    arguments: Mapping[str, object] = field(repr=False)
 
 
 @dataclass(frozen=True)
@@ -207,6 +244,7 @@ class ToolOutcome:
         asks_deletion_confirmation: The answer must be the fixed deletion
             question instead of the model's reply.
         completion: Set when the user's data was deleted; the turn ends with it.
+        search: The search this call ran, when it was one and it ran.
     """
 
     content: Mapping[str, object] = field(repr=False)
@@ -215,6 +253,7 @@ class ToolOutcome:
     availability_gaps: tuple[AvailabilityGap, ...] = ()
     asks_deletion_confirmation: bool = False
     completion: DeletionCompletion | None = None
+    search: SearchUsed | None = None
 
     def as_json(self) -> str:
         """Return the content as the JSON text the model reads."""
@@ -309,6 +348,25 @@ class SetStatusArguments(_Arguments):
         ge=0,
         description="Which of a list post's places or titles, as `get_item` numbers them.",
     )
+
+
+class SetProfileArguments(_Arguments):
+    """The arguments of `set_profile`; at least one is given."""
+
+    home_area: NonEmptyText | None = Field(
+        default=None,
+        description="Where the user lives, in their own words, e.g. a district or neighbourhood.",
+    )
+    country: CountryCode | None = Field(
+        default=None,
+        description="The user's country as an ISO 3166-1 alpha-2 code, e.g. 'TR' or 'JP'.",
+    )
+
+    @model_validator(mode="after")
+    def _something_to_set(self) -> "SetProfileArguments":
+        if self.home_area is None and self.country is None:
+            raise ValueError("give home_area, country or both")
+        return self
 
 
 class NoArguments(_Arguments):
@@ -507,6 +565,14 @@ class UserTools:
                 ),
                 parameters=SetStatusArguments.model_json_schema(),
             ),
+            ToolDefinition(
+                name=SET_PROFILE_TOOL,
+                description=(
+                    "Remember where the user lives (their home area) or their country, when "
+                    "they tell you. Used for 'near home' and for streaming in their country."
+                ),
+                parameters=SetProfileArguments.model_json_schema(),
+            ),
         )
 
     async def call(self, tool_call: ToolCall) -> ToolOutcome:
@@ -538,6 +604,9 @@ class UserTools:
             ),
             SET_STATUS_TOOL: lambda arguments: self._set_status(
                 SetStatusArguments.model_validate(arguments)
+            ),
+            SET_PROFILE_TOOL: lambda arguments: self._set_profile(
+                SetProfileArguments.model_validate(arguments)
             ),
             REQUEST_DATA_DELETION_TOOL: lambda arguments: self._request_data_deletion(
                 NoArguments.model_validate(arguments)
@@ -573,6 +642,7 @@ class UserTools:
             for name, value in arguments.filters.items()
         }
         return await self._search(
+            SearchUsed(SEARCH_ITEMS_TOOL, _json_arguments(arguments)),
             SearchQuery(
                 user_id=self._context.user_id,
                 country=self._context.country,
@@ -584,7 +654,7 @@ class UserTools:
                 text=arguments.text,
                 platform=arguments.platform,
                 saved_after=arguments.saved_after,
-            )
+            ),
         )
 
     async def _near(self, arguments: NearArguments) -> ToolOutcome:
@@ -601,6 +671,7 @@ class UserTools:
                 return _error("Search cannot check opening hours for these items.")
             filters[hours[1]] = arguments.open_now
         return await self._search(
+            SearchUsed(NEAR_TOOL, _json_arguments(arguments)),
             SearchQuery(
                 user_id=self._context.user_id,
                 country=self._context.country,
@@ -609,10 +680,10 @@ class UserTools:
                 tags=arguments.tags,
                 filters=filters,
                 text=arguments.text,
-            )
+            ),
         )
 
-    async def _search(self, query: SearchQuery) -> ToolOutcome:
+    async def _search(self, used: SearchUsed, query: SearchQuery) -> ToolOutcome:
         try:
             async with self._sessions() as session:
                 result = await self._retriever.search(session, query)
@@ -652,6 +723,7 @@ class UserTools:
             offered_item_ids=tuple(card.item_id for card in cards),
             notices=notices,
             availability_gaps=result.availability_gaps,
+            search=used,
         )
 
     async def _get_item(self, arguments: GetItemArguments) -> ToolOutcome:
@@ -743,6 +815,21 @@ class UserTools:
             offered_item_ids=(item.id,),
         )
 
+    async def _set_profile(self, arguments: SetProfileArguments) -> ToolOutcome:
+        changes = arguments.model_dump(exclude_none=True)
+        async with self._sessions() as session, session.begin():
+            if not await lock_user(session, self._context.user_id):
+                return _error("The user's profile could not be found.")
+            await session.execute(
+                update(User).where(User.id == self._context.user_id).values(**changes)
+            )
+        if arguments.country is not None:
+            # A search later in this turn already uses the country the user just gave.
+            self._context = replace(self._context, country=arguments.country)
+        # Which fields only: where a user lives is personal data.
+        logger.info("user_profile_updated", extra={"fields": sorted(changes)})
+        return ToolOutcome(content={"saved": changes})
+
     async def _request_data_deletion(self, arguments: NoArguments) -> ToolOutcome:
         # Nothing is stored yet: the request becomes confirmable only once the
         # question was delivered (`Toolbox.confirmation_delivered`).
@@ -814,6 +901,10 @@ async def _platform_recipients(
 
 def _error(message: str) -> ToolOutcome:
     return ToolOutcome(content={"error": message})
+
+
+def _json_arguments(arguments: BaseModel) -> dict[str, object]:
+    return arguments.model_dump(mode="json", exclude_defaults=True)
 
 
 def _validation_summary(error: ValidationError) -> str:

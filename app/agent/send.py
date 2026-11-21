@@ -1,6 +1,6 @@
 """Sends an agent answer, and only then makes a deletion question confirmable.
 
-The chat worker (not built yet, record 0015 Q5) calls `send_answer` for every
+The chat worker (`app/agent/chat.py`, record 0015 Q5) calls `send_answer` for every
 answer. A "delete my data" question must reach the user before their next
 message may confirm it, so the request is stored only after every message of
 the answer was sent. A question that failed to send, or was skipped because the
