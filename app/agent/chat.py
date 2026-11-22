@@ -20,6 +20,12 @@ For each text the user wrote to the bot:
    memory (`app/memory/session.py`), the messages in `conversation_msg` and
    the user's language (`app/memory/conversation.py`).
 
+**One answer at a time per sender** (owner decision of 22 Nov 2026). Steps 4
+and 5 run inside `ConversationStore.one_answer_at_a_time`, so the sender's
+next answer is sent only once this one was sent and stored, and the working
+set always holds the list the user saw last. The agent runs (step 3) still
+overlap, and other users never wait.
+
 **"Delete my data" never races an answer.** Step 4 and every write of step 5
 run inside `ConversationStore.hold`, which holds the user's row the erasure
 locks too, and only if the user still exists. An answer whose user was
@@ -303,7 +309,7 @@ class ChatResponder:
             return step
         if isinstance(step, _Sent):
             # An earlier try sent the answer; only storing it is left.
-            return await self._store(user_id, receipt_id, step, last_try=last_try)
+            return await self._store_sent(user_id, receipt_id, step, last_try=last_try)
         try:
             async with asyncio.timeout_at(deadline):
                 answer = await self._agent.answer(_turn(step))
@@ -360,17 +366,23 @@ class ChatResponder:
         if answer.deleted_recipients:
             return await self._send_after_deletion(prepared, answer)
         try:
-            sent = await self._send(prepared, answer)
+            # Sent and stored before the sender's next answer goes out.
+            async with self._conversations.one_answer_at_a_time(prepared.user_id) as conversations:
+                sent = await self._send(conversations, prepared, answer)
+                if isinstance(sent, ChatOutcome):
+                    return sent
+                return await self._store(
+                    conversations, prepared.user_id, prepared.receipt_id, sent, last_try=last_try
+                )
         except RETRYABLE_ERRORS as error:
             # A later try answers, or finds the reply mark and sends nothing.
             return await self._retry_or_fail(prepared, error, last_try=last_try)
-        if isinstance(sent, ChatOutcome):
-            return sent
-        return await self._store(prepared.user_id, prepared.receipt_id, sent, last_try=last_try)
 
-    async def _send(self, prepared: _Prepared, answer: AgentAnswer) -> _Sent | ChatOutcome:
+    async def _send(
+        self, conversations: ConversationStore, prepared: _Prepared, answer: AgentAnswer
+    ) -> _Sent | ChatOutcome:
         """Send the answer while holding the user, unless they were deleted or it was sent."""
-        async with self._conversations.hold(prepared.user_id) as held:
+        async with conversations.hold(prepared.user_id) as held:
             if held is None:
                 return ChatOutcome.NO_USER
             # Read before sending: a message that arrives while the question is
@@ -428,13 +440,32 @@ class ChatResponder:
             deletion_request=request,
         )
 
-    async def _store(
+    async def _store_sent(
         self, user_id: uuid.UUID, receipt_id: uuid.UUID, sent: _Sent, *, last_try: bool
+    ) -> ChatOutcome:
+        """Store an exchange an earlier try sent, one answer of the sender at a time."""
+        try:
+            async with self._conversations.one_answer_at_a_time(user_id) as conversations:
+                return await self._store(
+                    conversations, user_id, receipt_id, sent, last_try=last_try
+                )
+        except STORE_ERRORS as error:
+            logger.warning("chat_exchange_store_failed", extra={"error": type(error).__name__})
+            return _give_up_storing(last_try=last_try)
+
+    async def _store(
+        self,
+        conversations: ConversationStore,
+        user_id: uuid.UUID,
+        receipt_id: uuid.UUID,
+        sent: _Sent,
+        *,
+        last_try: bool,
     ) -> ChatOutcome:
         """Store a sent exchange, trying again after a failure; never send anything."""
         for attempt in range(1, self._store_tries + 1):
             try:
-                await self._store_once(user_id, receipt_id, sent)
+                await self._store_once(conversations, user_id, receipt_id, sent)
             except STORE_ERRORS as error:
                 logger.warning(
                     "chat_exchange_store_failed",
@@ -444,12 +475,15 @@ class ChatResponder:
                     await self._sleep(self._store_retry_delay_seconds * attempt)
             else:
                 return ChatOutcome.ANSWERED if sent.sent_whole else ChatOutcome.OUTSIDE_REPLY_WINDOW
-        if not last_try:
-            raise RetryLaterError("the sent exchange is not stored yet")
-        logger.error("chat_exchange_not_stored")
-        return ChatOutcome.NOT_STORED
+        return _give_up_storing(last_try=last_try)
 
-    async def _store_once(self, user_id: uuid.UUID, receipt_id: uuid.UUID, sent: _Sent) -> None:
+    async def _store_once(
+        self,
+        conversations: ConversationStore,
+        user_id: uuid.UUID,
+        receipt_id: uuid.UUID,
+        sent: _Sent,
+    ) -> None:
         """Record the delivery in both stores, then store the rest in short-term memory.
 
         The rows and the `delivered` mark are each tried, so either store alone
@@ -459,7 +493,7 @@ class ChatResponder:
         exchange = sent.exchange()
         rows_error: SQLAlchemyError | None = None
         try:
-            async with self._conversations.hold(user_id) as held:
+            async with conversations.hold(user_id) as held:
                 if held is None:
                     return
                 await held.record(receipt_id, exchange.messages, exchange.language)
@@ -468,7 +502,7 @@ class ChatResponder:
         await self._memory.reply_delivered(user_id, receipt_id, sent_whole=sent.sent_whole)
         if rows_error is not None:
             raise rows_error
-        async with self._conversations.hold(user_id) as held:
+        async with conversations.hold(user_id) as held:
             if held is None:
                 return
             reply = await self._memory.reply(user_id, receipt_id)
@@ -483,7 +517,10 @@ class ChatResponder:
         logger.error("chat_answer_failed", extra={"error": type(error).__name__})
         if prepared is None:
             return ChatOutcome.FAILED
-        async with self._conversations.hold(prepared.user_id) as held:
+        async with (
+            self._conversations.one_answer_at_a_time(prepared.user_id) as conversations,
+            conversations.hold(prepared.user_id) as held,
+        ):
             if held is None:
                 return ChatOutcome.NO_USER
             if await self._memory.start_reply(prepared.user_id, prepared.receipt_id, None) is None:
@@ -498,6 +535,14 @@ class ChatResponder:
             except MessengerError as send_error:
                 logger.warning("chat_error_send_failed", extra={"error": type(send_error).__name__})
         return ChatOutcome.FAILED
+
+
+def _give_up_storing(*, last_try: bool) -> ChatOutcome:
+    """Leave a sent exchange to the job's next try, or, on the last one, unstored."""
+    if not last_try:
+        raise RetryLaterError("the sent exchange is not stored yet")
+    logger.error("chat_exchange_not_stored")
+    return ChatOutcome.NOT_STORED
 
 
 def _turn(prepared: _Prepared) -> AgentTurn:

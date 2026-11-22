@@ -16,6 +16,14 @@ waits until the block ends and then erases what the block wrote; a block that
 starts after the erasure finds no user and writes nothing. `FOR KEY SHARE`
 doesn't make ingestion wait, nor another answer of the same user.
 
+**One answer at a time per sender** (`one_answer_at_a_time`, owner decision of
+22 Nov 2026). Sending an answer and storing its exchange run while the job
+holds a Postgres advisory lock of the sender, on one connection of its own
+that also runs the block's transactions. Another answer to the same sender
+waits until the first was sent and stored, so the working set always belongs
+to the list the user saw last. Answers to other users, ingestion and "delete
+my data" don't take this lock and never wait for it.
+
 An exchange's rows get ids made from the message's receipt and their place in
 the exchange (`exchange_message_id`), so storing the same exchange again adds
 nothing. They are written only after the answer was sent, so they also prove
@@ -27,13 +35,19 @@ import uuid
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from typing import Final
 
 from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, async_sessionmaker
 
 from app.db.models import ConversationMessage, PlatformAccount, User
 from app.memory.session import SessionMessage
+
+# Names a sender's advisory lock, hashed to the 64-bit key Postgres wants; two
+# senders whose keys collide only wait for each other.
+_ANSWER_LOCK_PREFIX: Final = "chat_answer"
+_ANSWER_LOCK_HASH_SEED: Final = 0
 
 
 @dataclass(frozen=True)
@@ -125,6 +139,40 @@ class ConversationStore:
         return stored or 0
 
     @asynccontextmanager
+    async def one_answer_at_a_time(self, user_id: uuid.UUID) -> AsyncIterator["ConversationStore"]:
+        """Let only one answer to a sender be sent and stored at a time.
+
+        Waits for the sender's advisory lock and keeps it until the block
+        ends. The lock belongs to a connection of the block's own, so the
+        yielded store runs its transactions (`hold`) on that connection.
+
+        Args:
+            user_id: The DM's sender.
+
+        Yields:
+            The store to send and store this answer with.
+
+        Raises:
+            sqlalchemy.exc.SQLAlchemyError: If the database failed; a
+                connection that couldn't release the lock is closed, which
+                releases it.
+        """
+        key = func.hashtextextended(f"{_ANSWER_LOCK_PREFIX}:{user_id}", _ANSWER_LOCK_HASH_SEED)
+        async with _own_connection(self._sessions) as connection:
+            sessions = async_sessionmaker(**{**self._sessions.kw, "bind": connection})
+            async with sessions() as session, session.begin():
+                await session.execute(select(func.pg_advisory_lock(key)))
+            try:
+                yield ConversationStore(sessions)
+            finally:
+                try:
+                    async with sessions() as session, session.begin():
+                        await session.execute(select(func.pg_advisory_unlock(key)))
+                except BaseException:
+                    await connection.invalidate()
+                    raise
+
+    @asynccontextmanager
     async def hold(self, user_id: uuid.UUID) -> AsyncIterator["HeldUser | None"]:
         """Hold the user's row until the block ends, so "delete my data" waits for it.
 
@@ -199,6 +247,23 @@ class HeldUser:
             await self._session.execute(
                 update(User).where(User.id == self._user_id).values(language=language)
             )
+
+
+@asynccontextmanager
+async def _own_connection(
+    sessions: async_sessionmaker[AsyncSession],
+) -> AsyncIterator[AsyncConnection]:
+    """Open a connection of its own, unless the factory is bound to one already.
+
+    A factory bound to one connection (as in tests that roll everything back)
+    already gives every session that connection.
+    """
+    bind = sessions.kw["bind"]
+    if isinstance(bind, AsyncConnection):
+        yield bind
+        return
+    async with bind.connect() as connection:
+        yield connection
 
 
 def exchange_message_id(receipt_id: uuid.UUID, position: int) -> uuid.UUID:

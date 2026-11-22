@@ -27,7 +27,11 @@ from app.agent.replies.templates import (
     deletion_done,
     reply_wording,
 )
-from app.agent.tools import CONFIRM_DATA_DELETION_TOOL, REQUEST_DATA_DELETION_TOOL
+from app.agent.tools import (
+    CONFIRM_DATA_DELETION_TOOL,
+    REQUEST_DATA_DELETION_TOOL,
+    SEARCH_ITEMS_TOOL,
+)
 from app.db.session import create_engine, create_session_factory
 from tests.agent.agent_support import CONFIRM_SECONDS, final_answer, tool_calls
 from tests.agent.chat_support import (
@@ -35,6 +39,7 @@ from tests.agent.chat_support import (
     ChatUnderTest,
     build_chat,
     count_messages,
+    seed_place,
     stored_user,
 )
 from tests.database import run_alembic
@@ -138,10 +143,11 @@ async def test_a_deletion_waits_for_an_answer_being_sent_and_then_erases_it(
         return await send(recipient_id, messages, last_user_message_at)
 
     monkeypatch.setattr(ordinary.sender, "send", pause_then_send)
+    # The question is delivered first: answers to one sender go out one at a time.
+    tapped = await ask_and_tap(chat_stores, user_id, deleting)
     answering = asyncio.create_task(ordinary.responder.respond(user_id, question, last_try=False))
     await pause.reached.wait()
 
-    tapped = await ask_and_tap(chat_stores, user_id, deleting)
     deleting_task = asyncio.create_task(deleting.responder.respond(user_id, tapped, last_try=False))
     finished, _ = await asyncio.wait({deleting_task}, timeout=BLOCKED_SECONDS)
     assert not finished, "the deletion did not wait for the answer being sent"
@@ -152,3 +158,78 @@ async def test_a_deletion_waits_for_an_answer_being_sent_and_then_erases_it(
     assert ordinary.sent_texts() == ["Sent before the deletion."]
     assert deleting.sent_texts() == [QUESTION, DONE]
     await assert_nothing_left(chat_stores, user_id, redis_url)
+
+
+async def test_answers_to_one_sender_are_sent_and_stored_one_at_a_time(
+    chat_stores: ChatStores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user_id = await chat_stores.new_user(SENDER_ID)
+    first_place = await seed_place(
+        chat_stores, user_id, "Synthetic Meze", district="Bebek", price="cheap", saved_days_ago=2
+    )
+    second_place = await seed_place(
+        chat_stores,
+        user_id,
+        "Synthetic Köfte",
+        district="Beşiktaş",
+        price="cheap",
+        saved_days_ago=1,
+    )
+    search = tool_calls((SEARCH_ITEMS_TOOL, {"category": "restaurant"}))
+    first = build_chat(chat_stores, [search, final_answer("en", "List A:", [first_place.id])])
+    second = build_chat(
+        chat_stores,
+        [
+            search,
+            final_answer("en", "List B:", [second_place.id]),
+            final_answer("en", "That one."),
+        ],
+    )
+    delivered: list[tuple[uuid.UUID, ...]] = []
+    pause = Pause()
+
+    def recording(chat: ChatUnderTest, *, paused: bool) -> None:
+        send = chat.sender.send
+
+        async def send_and_record(
+            recipient_id: str, messages: AnswerMessages, last_user_message_at: datetime
+        ) -> DeliveryReport:
+            if paused:
+                await pause.hold()
+            report = await send(recipient_id, messages, last_user_message_at)
+            delivered.append(tuple(card.item_id for card in messages.results))
+            return report
+
+        monkeypatch.setattr(chat.sender, "send", send_and_record)
+
+    recording(first, paused=True)
+    recording(second, paused=False)
+    turns: list[AgentTurn] = []
+    answer = second.agent.agent.answer
+
+    async def answer_and_record(turn: AgentTurn) -> AgentAnswer:
+        turns.append(turn)
+        return await answer(turn)
+
+    monkeypatch.setattr(second.agent.agent, "answer", answer_and_record)
+    text_a = await chat_stores.send_text(user_id, "restaurants in Bebek")
+    text_b = await chat_stores.send_text(user_id, "restaurants in Beşiktaş")
+
+    # A has its delivery order and is inside its sender when B is ready to send.
+    answering_a = asyncio.create_task(first.responder.respond(user_id, text_a, last_try=False))
+    await pause.reached.wait()
+    answering_b = asyncio.create_task(second.responder.respond(user_id, text_b, last_try=False))
+    finished, _ = await asyncio.wait({answering_b}, timeout=BLOCKED_SECONDS)
+    assert not finished, "B was sent while A, sent before it, was still being sent"
+    pause.resume.set()
+
+    assert await answering_a is ChatOutcome.ANSWERED
+    assert await answering_b is ChatOutcome.ANSWERED
+    assert delivered == [(first_place.id,), (second_place.id,)]
+    last_list = delivered[-1]
+    session = await chat_stores.memory.load(user_id)
+    assert session.working_set is not None
+    assert session.working_set.item_ids == last_list
+    follow_up = await chat_stores.send_text(user_id, "the first one")
+    await second.responder.respond(user_id, follow_up, last_try=False)
+    assert tuple(turns[-1].working_set) == last_list

@@ -29,7 +29,8 @@ class AgentSettings(BaseSettings):
             came through it (`VOCAB_ALIAS_REVIEW_MIN_USERS`, ARCHITECTURE §3.4).
             One user's repeated corrections count once.
         data_deletion_confirm_seconds: How long a "delete my data" request
-            waits for the user's confirmation (`DATA_DELETION_CONFIRM_SECONDS`).
+            waits for the user's confirmation, counted from when sending the
+            question begins (`DATA_DELETION_CONFIRM_SECONDS`).
             Only the user's next message can confirm it, and only within this time.
     """
 

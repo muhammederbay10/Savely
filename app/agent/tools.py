@@ -35,7 +35,7 @@ these hold, and refuses otherwise:
   (`ToolContext.deletion_confirmed`): a tap on the question's "Yes, delete"
   button, whose fixed payload the chat worker (SAV-18) checks with
   `confirms_deletion`. A typed "yes" never counts; the question is asked again;
-- the deadline (`DATA_DELETION_CONFIRM_SECONDS` after delivery) has not passed,
+- the deadline (`DATA_DELETION_CONFIRM_SECONDS` after sending the question began) has not passed,
   checked right before erasing.
 
 A successful erasure ends the turn (`ToolOutcome.completion`): the "done"

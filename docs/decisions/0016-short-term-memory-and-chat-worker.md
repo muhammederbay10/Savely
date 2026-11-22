@@ -1,7 +1,7 @@
 # 0016: Short-term memory, the basic profile and the chat worker
 
-- Status: proposed with SAV-18; it takes effect when SAV-18's pull request is merged. The open questions below are for Muhammed.
-- Date: 2026-11-21, updated 2026-11-22 after review rounds 1 to 3 (points 5 to 8)
+- Status: proposed with SAV-18; it takes effect when SAV-18's pull request is merged. Muhammed decided all open points in chat on 2026-11-22 ("Approve all five"); evidence: SAV-18 comment `01a20456-384c-7d33-a2c5-3ba8c67647b0`, see [Owner decisions](#owner-decisions).
+- Date: 2026-11-21, updated 2026-11-22 after review rounds 1 to 4 (points 5 to 9) and the owner decisions
 - Ticket: SAV-18
 
 ## Context
@@ -22,6 +22,8 @@ The owner update of 20 Nov 2026 on SAV-18 (record 0015, Q2, Q5 and Q9) moved the
 7. **"Yes, delete" counts only on the next received message** (refines record 0015, point 10). `deletion_confirmed = confirms_deletion(message.quick_reply_payload)` as before, but "next" no longer depends on which job runs first. Ingestion gives every new message of a user, share or text, the next number, once per platform message id (`savely:ingestion:<user id>:messages`, a hash of each message's number and the last one), so a repeated delivery keeps its number and a new message re-sharing a post gets a new one; a share without a message id counts on every delivery. Right before the question is sent the worker reads the last number, and the delivered request waits for the one after it (`PendingDeletion.awaited_message`). Only the turn of that message takes the request (`take`, one atomic Redis script); a "no", a share or any other message in between uses it up, also when the tap's job runs first, is retried later or the tap is delivered twice. A typed "yes", an expired tap and another user's tap still delete nothing.
 8. **"Delete my data" never races an answer.** The worker sends, and writes anything for the user (reply marks, the delivered request, history, working set, rows, language), only inside `ConversationStore.hold`: a transaction holding the user's row `FOR KEY SHARE`, and only if the user still exists. The erasure locks the same row `FOR UPDATE`, so it waits for an answer being sent or stored and then erases it, and an answer that gets there after the erasure is neither sent nor stored. `FOR KEY SHARE` doesn't block ingestion or the user's other answers. Only the "done" message is sent without the hold, to the recipients read before the erasure. `build_toolbox` gives `UserDataEraser` ingestion's state and jobs, the pending request, `SessionMemory` and the media store; `conversation_msg` rows and the profile go with the `user` row.
 
+9. **One answer at a time per sender** (owner decision 1). Sending an answer and storing its exchange run inside `ConversationStore.one_answer_at_a_time`: a Postgres advisory lock of the sender (`pg_advisory_lock(hashtextextended('chat_answer:<user id>', 0))`), held on a connection of the job's own that also runs the send and store transactions, and released at the end (closing the connection releases it too). The sender's next answer, or its error message, waits until this one was sent and stored, so the working set always belongs to the list the user saw last; an answer that started sending earlier but finishes later can no longer leave an older list behind. The agent runs still overlap; other users, ingestion and "delete my data" never take this lock. The delivery order of point 6 stays, for stores retried later.
+
 ## Alternatives considered
 
 - **One JSON value per user for the whole session**: simpler, but two answers ending together would lose one exchange.
@@ -30,19 +32,28 @@ The owner update of 20 Nov 2026 on SAV-18 (record 0015, Q2, Q5 and Q9) moved the
 - **A separate "is the user still there?" check before sending or storing**: an erasure could still run between the check and the write; holding the row closes that gap.
 - **Binding the question to the next message's receipt at ingestion**: needs ingestion to read and change the agent's request; a message number from ingestion and the number stored with the request do the same with one counter, and shares count too.
 - **Storing the exchange only through the job's retries**: a Redis outage right after sending would leave no `delivered` mark, and the next try could only skip; trying again within the run, and keeping the planned exchange with the `sending` mark, lets either store carry it to the next try.
+- **A working-set version from successful delivery instead of serializing**: would need a delivery counter written after the send, which a Redis failure there could lose; Muhammed preferred serializing, which also keeps the history in sending order.
+- **A Redis lock per sender**: needs a lease and polling; the advisory lock waits without polling and is released when its connection closes.
 - **A new table for answers in progress**: would be a durable record of its own, but needs a migration; the `conversation_msg` rows already prove a delivery, and the rest of the exchange waits in the `sending` mark.
 - **Storing the deletion request right after sending, outside the exchange**: a Redis failure there left a sent question that could never be confirmed; planning it before sending and storing it with the exchange keeps its awaited message and deadline whenever it is stored.
 - **Reading the history from `conversation_msg`**: would not expire with the reply window, and costs a query per turn; Postgres keeps the record, Redis serves the turn.
 
 ## Consequences
 
-- **Prompt version `2026-11-21.1`**: adds the profile line, the follow-up rules, `set_profile` and the working set's searches to `2026-11-20.3`. Like it, it is scored on the evaluation set when SAV-19/20 exist; there is no agent eval set yet, so there are no before/after numbers.
-- **New settings:** `SESSION_TTL_SECONDS`, `SESSION_HISTORY_MESSAGES`, `CHAT_CONCURRENCY`, `CHAT_MAX_TRIES`, `CHAT_RETRY_DELAY_SECONDS`, `CHAT_RUN_DEADLINE_SECONDS`, `CHAT_JOB_TIMEOUT_SECONDS` (`ChatSettings`).
+- **Prompt version `2026-11-21.1`**: adds the profile line, the follow-up rules, `set_profile` and the working set's searches to `2026-11-20.3`. Approved provisionally (owner decision 5); like `2026-11-20.3` it is scored on the evaluation set when SAV-19/20 exist. There is no agent eval set yet, so there are no before/after numbers: the fake-model tests show the worker's and tools' behaviour, not the model's quality.
+- **New settings:** `SESSION_TTL_SECONDS`, `SESSION_HISTORY_MESSAGES`, `CHAT_CONCURRENCY`, `CHAT_MAX_TRIES`, `CHAT_RETRY_DELAY_SECONDS`, `CHAT_RUN_DEADLINE_SECONDS`, `CHAT_JOB_TIMEOUT_SECONDS` (`ChatSettings`, `app/config/chat.py`). The values in `.env.example` are approved (owner decision 3) and stay settings.
 - **No schema change:** `user.home_area`, `user.country`, `user.language` and `conversation_msg` exist since migration 0001; the message counter is a Redis key, and the idempotent rows use the existing `conversation_msg.id`.
-- **Limits:** messages of one user answered at the same time don't see each other in their history. A "Yes, delete" tap whose turn fails deletes nothing (the request was used up); the user asks again. A message that arrives while the question is being sent is the next one, so a typed message there uses the question up. A tap whose job runs before the question was recorded as delivered (the user tapped within the send call) deletes nothing. If both stores fail right after an answer was sent, the next try can't tell whether it arrived and keeps nothing, and if a store stays down for every try, the last one gives up. A deletion question whose request is stored only after the user already sent their next message can't be confirmed any more; the user asks again. `conversation_msg` keeps every exchange until "delete my data", with no expiry.
+- **Limits:** messages of one user answered at the same time don't see each other in their history (their agent runs overlap; only sending and storing go one at a time). A "Yes, delete" tap whose turn fails deletes nothing (the request was used up); the user asks again. A message that arrives while the question is being sent is the next one, so a typed message there uses the question up. A tap whose job runs before the question was recorded as delivered (the user tapped within the send call) deletes nothing. If both stores fail right after an answer was sent, the next try can't tell whether it arrived and keeps nothing, and if a store stays down for every try, the last one gives up. A deletion question whose request is stored only after the user already sent their next message can't be confirmed any more; the user asks again.
+- **Retention:** `conversation_msg` keeps every exchange until "delete my data", with no expiry, for Phase 1 (owner decision 4). An automatic expiry may come as a small ticket before the public launch; it is not part of SAV-18.
 
-## Open questions for the owner
+## Owner decisions
 
-1. The setting values in `.env.example` (24 h, 20 messages, 3 tries, 60 s deadline, 180 s job timeout, 10 at once) are first choices.
-2. `conversation_msg` keeps messages until "delete my data". Should it expire, like short-term memory?
-3. Prompt `2026-11-21.1` changes the approved `2026-11-20.3` wording (Q3); approve for now, as with 0015?
+Muhammed decided all five open points in chat on 2026-11-22 ("Approve all five"). Evidence: SAV-18 comment `01a20456-384c-7d33-a2c5-3ba8c67647b0`, passed on by Jarvis in `01a20457-04df-7c1f-b14f-dc80a98af2e5`. None is open.
+
+| # | Question | Decision | Where it is done |
+|---|---|---|---|
+| 1 | A 5th review round for the remaining ordering defect (an answer that started sending earlier finished later, and the working set kept the older list) | Approved, with his preferred fix: serialize outgoing answers per sender | Point 9; `tests/agent/test_chat_overlap.py` |
+| 2 | When the deletion confirmation window starts | When sending the question begins (as implemented); the send time shortens the window. Record 0015 §10 is updated | Point 7; `Toolbox.deletion_request`, `app/agent/send.py` |
+| 3 | The first setting values: 24 h session, 20 messages, 3 tries, 60 s run deadline, 180 s job timeout, 10 jobs at once | Approved; they stay settings in `app/config/chat.py` and `.env.example` | `ChatSettings`, `.env.example` |
+| 4 | Whether `conversation_msg` expires | Kept until "delete my data" for Phase 1; an automatic expiry is a possible small ticket before the public launch, not SAV-18 | Consequences: retention |
+| 5 | Prompt `2026-11-21.1` | Approved provisionally; quality is scored with SAV-19/20. Fake-model tests don't establish quality | Consequences: prompt version |

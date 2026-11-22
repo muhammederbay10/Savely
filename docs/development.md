@@ -629,7 +629,7 @@ The wording sent to the text model is `AGENT_PROMPTS` in [`app/agent/prompts.py`
 | `AGENT_MAX_RESULTS_PER_ANSWER` | The most saved items one answer sends back; the rest are kept for "show more" |
 | `AGENT_MAX_OUTPUT_TOKENS` | The longest reply the text model may write per call |
 | `VOCAB_ALIAS_REVIEW_MIN_USERS` | Different users whose corrections flag a verified vocabulary alias for review; at least 2 |
-| `DATA_DELETION_CONFIRM_SECONDS` | How long a delivered "delete my data" question may be confirmed |
+| `DATA_DELETION_CONFIRM_SECONDS` | How long a delivered "delete my data" question may be confirmed, counted from when sending it began |
 
 They are read through `AgentSettings` in [`app/config/agent.py`](../app/config/agent.py), with `get_agent_settings()`, with the same rules as the other settings classes.
 
@@ -650,6 +650,10 @@ For each text ([`app/agent/chat.py`](../app/agent/chat.py)):
 3. Run the response agent for that user only, with the user taken from the DM's sender. `deletion_confirmed` is set only when the message is a tap on the "Yes, delete" button, and the message's number must be the one the delivered question waits for: the sender's next message after it was sent. A "no", a share or any other message in between uses the question up, also when the tap's job runs first.
 4. Send the answer within Instagram's 24-hour window, counted from when the user sent the text.
 5. Store the exchange and the new working set in Redis, the messages in `conversation_msg`, and the language the user wrote in as `user.language` (the save confirmations use it).
+
+**One answer at a time per sender.** Steps 4 and 5 run while the job holds the sender's Postgres advisory lock (`ConversationStore.one_answer_at_a_time`), on a connection of its own that also runs the send and store transactions. The sender's next answer, or the bot's error message, waits until this one was sent and stored, so the working set is always the list the user saw last. The agent runs still overlap, and other users, ingestion and "delete my data" never wait for this lock.
+
+**Retention.** `conversation_msg` keeps every exchange until "delete my data" (Phase 1, record 0016); the Redis session expires after `SESSION_TTL_SECONDS`.
 
 **Answers never outlive "delete my data".** Steps 4 and 5 run while the job holds the user's row with `FOR KEY SHARE` ([`ConversationStore.hold`](../app/memory/conversation.py)), which the erasure's `FOR UPDATE` waits for, and only if the user still exists. An answer whose user was deleted first is neither sent nor stored; an erasure that starts while an answer is being sent or stored waits, then erases what was stored. Ingestion and other answers of the same user don't wait for this hold. Only the "done" message after a deletion is sent without it.
 
