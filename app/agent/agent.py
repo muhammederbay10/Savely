@@ -119,6 +119,9 @@ class AgentTurn:
         working_set_shown: How many of `working_set` were sent to the user;
             `None` means all of them.
         working_set_searches: The searches `working_set` came from.
+        message_number: The message's number among the sender's messages, from
+            ingestion. A deletion question can be confirmed only by the turn of
+            the message right after it; `None` confirms none.
     """
 
     user_id: uuid.UUID
@@ -130,6 +133,7 @@ class AgentTurn:
     home_area: str | None = field(default=None, repr=False)
     working_set_shown: int | None = None
     working_set_searches: Sequence[SearchUsed] = ()
+    message_number: int | None = None
 
 
 @dataclass(frozen=True)
@@ -273,6 +277,7 @@ class ResponseAgent:
                 user_id=turn.user_id,
                 country=turn.country,
                 deletion_confirmed=turn.deletion_confirmed,
+                message_number=turn.message_number,
             )
         )
         await tools.begin_turn()

@@ -611,6 +611,27 @@ async def test_two_different_texts_are_two_chat_jobs(
     assert len(job_queue.named(ANSWER_CHAT_MESSAGE_JOB)) == 2
 
 
+async def test_every_new_message_gets_the_next_number_and_a_redelivery_keeps_its_own(
+    ingestion: IngestionService, ingestion_state: RedisIngestionState, user_id: uuid.UUID
+) -> None:
+    await ingestion.ingest_capture(reel_share(user_id))
+    question = text_message(user_id, text=QUESTION, message_id=QUESTION_MESSAGE_ID)
+    await ingestion.ingest_chat_message(question)
+    await ingestion.ingest_chat_message(question)
+    await ingestion.ingest_chat_message(
+        text_message(user_id, text=QUESTION, message_id=THIRD_MESSAGE_ID)
+    )
+
+    numbers = [
+        receipt.number
+        for message_id in (QUESTION_MESSAGE_ID, THIRD_MESSAGE_ID)
+        if (receipt := await ingestion_state.text_receipt(user_id, INSTAGRAM, message_id))
+    ]
+    # The share is message 1; the redelivered question keeps number 2.
+    assert numbers == [2, 3]
+    assert await ingestion_state.last_message_number(user_id) == 3
+
+
 # --- Regressions from the first review (fix round 1) ---------------------------
 
 POST_A = "18000000000000211"

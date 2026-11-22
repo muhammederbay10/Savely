@@ -61,8 +61,11 @@ class MemoryDeletionRequests(DeletionRequests):
     async def save(self, user_id: uuid.UUID, pending: PendingDeletion, now: datetime) -> None:
         self.requests[user_id] = pending
 
-    async def take(self, user_id: uuid.UUID) -> PendingDeletion | None:
-        return self.requests.pop(user_id, None)
+    async def take(self, user_id: uuid.UUID, message_number: int) -> PendingDeletion | None:
+        pending = self.requests.get(user_id)
+        if pending is None or pending.awaited_message != message_number:
+            return None
+        return self.requests.pop(user_id)
 
 
 def agent_settings(**overrides: int) -> AgentSettings:

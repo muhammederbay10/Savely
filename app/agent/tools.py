@@ -25,8 +25,11 @@ these hold, and refuses otherwise:
 
 - the confirmation question was delivered: `Toolbox.confirmation_delivered`
   stores the request only after the whole answer was sent;
-- this turn is the user's next message: `begin_turn` takes the request out, so
-  "no" or any other message uses it up, and a request of the same turn never counts;
+- this turn answers the user's next message after the question: the request
+  waits for that message's number, given by ingestion in the order messages
+  arrive (`ToolContext.message_number`), and only its turn takes the request
+  out (`begin_turn`). "No", a share or any other message in between uses it
+  up, whatever order the jobs run in, and a request of the same turn never counts;
 - the caller reports an explicit confirmation with this message
   (`ToolContext.deletion_confirmed`): a tap on the question's "Yes, delete"
   button, whose fixed payload the chat worker (SAV-18) checks with
@@ -224,11 +227,15 @@ class ToolContext:
             `None` if it is not known yet.
         deletion_confirmed: This message is a tap on the deletion question's
             "Yes, delete" button (record 0015, Q9); without it no deletion runs.
+        message_number: The message's number among the sender's messages,
+            from ingestion; `None` for a turn that answers no numbered
+            message, which can't confirm a deletion.
     """
 
     user_id: uuid.UUID
     country: str | None
     deletion_confirmed: bool = False
+    message_number: int | None = None
 
 
 @dataclass(frozen=True)
@@ -411,7 +418,7 @@ class Toolbox:
         self._now = now
 
     async def confirmation_delivered(
-        self, user_id: uuid.UUID, confirmation: DeletionConfirmation
+        self, user_id: uuid.UUID, confirmation: DeletionConfirmation, last_message_number: int
     ) -> None:
         """Make a delivered deletion question confirmable by the user's next message.
 
@@ -420,6 +427,8 @@ class Toolbox:
         Args:
             user_id: The DM's sender the question was sent to.
             confirmation: The question's language and prepared "done" message.
+            last_message_number: The number of the user's last message before
+                the question was sent; only the one after it can confirm.
 
         Raises:
             redis.exceptions.RedisError: If Redis cannot be reached.
@@ -427,6 +436,7 @@ class Toolbox:
         now = self._now()
         pending = PendingDeletion(
             deadline=now + self._deletion_window,
+            awaited_message=last_message_number + 1,
             language=confirmation.language,
             done_text=confirmation.done_text,
         )
@@ -492,15 +502,20 @@ class UserTools:
         self._pending_deletion: PendingDeletion | None = None
 
     async def begin_turn(self) -> None:
-        """Take the user's pending deletion request out, before the turn's first tool call.
+        """Take the user's pending deletion request out, if it waits for this message.
 
-        Only this turn can confirm it. Whatever the user wrote, the request is
-        gone afterwards, so "no" or any other message cancels it.
+        Only the turn of the user's next message after the question can
+        confirm it. Whatever the user wrote, the request is gone afterwards, so
+        "no" or any other message cancels it.
 
         Raises:
             redis.exceptions.RedisError: If Redis cannot be reached.
         """
-        self._pending_deletion = await self._deletion_requests.take(self._context.user_id)
+        if self._context.message_number is None:
+            return
+        self._pending_deletion = await self._deletion_requests.take(
+            self._context.user_id, self._context.message_number
+        )
 
     def definitions(self) -> tuple[ToolDefinition, ...]:
         """Describe every tool for the model.

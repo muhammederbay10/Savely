@@ -12,7 +12,15 @@ import pytest
 from arq.connections import ArqRedis
 
 from app.agent.tools import SEARCH_ITEMS_TOOL, SearchUsed
-from app.memory.session import Session, SessionMemory, SessionMessage, WorkingSet
+from app.memory.session import (
+    Exchange,
+    Reply,
+    ReplyState,
+    Session,
+    SessionMemory,
+    SessionMessage,
+    WorkingSet,
+)
 
 DAY = timedelta(hours=24)
 AT = datetime(2026, 11, 21, 12, 0, tzinfo=UTC)
@@ -36,13 +44,29 @@ def working_set(*item_ids: uuid.UUID, shown: int = 1) -> WorkingSet:
     return WorkingSet(item_ids=item_ids, shown=shown, searches=(SEARCH,))
 
 
+def exchange(*numbers: int, results: WorkingSet | None = None) -> Exchange:
+    return Exchange(
+        messages=tuple(message(number) for number in numbers),
+        working_set=results,
+        language="en",
+        sent_whole=True,
+    )
+
+
+async def remember(
+    memory: SessionMemory, user_id: uuid.UUID, numbers: list[int], results: WorkingSet | None
+) -> None:
+    """Store one answered message's exchange."""
+    await memory.remember(user_id, uuid.uuid4(), exchange(*numbers, results=results))
+
+
 async def test_an_exchange_and_its_working_set_are_read_back(
     ingestion_redis: ArqRedis, user_id: uuid.UUID
 ) -> None:
     memory = SessionMemory(ingestion_redis, lifetime=DAY, max_messages=20)
     results = working_set(uuid.uuid4(), uuid.uuid4(), shown=1)
 
-    await memory.remember(user_id, [message(1), message(2)], results)
+    await remember(memory, user_id, [1, 2], results)
 
     assert await memory.load(user_id) == Session(
         history=(message(1), message(2)), working_set=results
@@ -54,8 +78,8 @@ async def test_only_the_last_messages_are_kept_oldest_first(
 ) -> None:
     memory = SessionMemory(ingestion_redis, lifetime=DAY, max_messages=3)
 
-    await memory.remember(user_id, [message(1), message(2)], None)
-    await memory.remember(user_id, [message(3), message(4)], None)
+    await remember(memory, user_id, [1, 2], None)
+    await remember(memory, user_id, [3, 4], None)
 
     session = await memory.load(user_id)
     assert session.history == (message(2), message(3), message(4))
@@ -67,11 +91,11 @@ async def test_an_answer_without_results_keeps_the_last_working_set(
     memory = SessionMemory(ingestion_redis, lifetime=DAY, max_messages=20)
     first, second = working_set(uuid.uuid4()), working_set(uuid.uuid4())
 
-    await memory.remember(user_id, [message(1)], first)
-    await memory.remember(user_id, [message(2)], None)
+    await remember(memory, user_id, [1], first)
+    await remember(memory, user_id, [2], None)
     assert (await memory.load(user_id)).working_set == first
 
-    await memory.remember(user_id, [message(3)], second)
+    await remember(memory, user_id, [3], second)
     assert (await memory.load(user_id)).working_set == second
 
 
@@ -79,7 +103,7 @@ async def test_the_session_expires_after_its_lifetime(
     ingestion_redis: ArqRedis, user_id: uuid.UUID
 ) -> None:
     memory = SessionMemory(ingestion_redis, lifetime=SHORT_LIFETIME, max_messages=20)
-    await memory.remember(user_id, [message(1), message(2)], working_set(uuid.uuid4()))
+    await remember(memory, user_id, [1, 2], working_set(uuid.uuid4()))
     await memory.start_reply(user_id, uuid.uuid4())
 
     await asyncio.sleep(SHORT_LIFETIME.total_seconds() * 2)
@@ -92,14 +116,14 @@ async def test_every_write_restarts_the_lifetime_of_the_whole_session(
     ingestion_redis: ArqRedis, user_id: uuid.UUID
 ) -> None:
     memory = SessionMemory(ingestion_redis, lifetime=DAY, max_messages=20)
-    await memory.remember(user_id, [message(1)], working_set(uuid.uuid4()))
+    await remember(memory, user_id, [1], working_set(uuid.uuid4()))
     keys = await ingestion_redis.keys(f"*{user_id}*")
     for key in keys:
         await ingestion_redis.pexpire(key, 1000)
 
-    await memory.remember(user_id, [message(2)], None)
+    await remember(memory, user_id, [2], None)
 
-    assert len(keys) == 2
+    assert len(keys) == 3
     for key in keys:
         remaining_ms = await ingestion_redis.pttl(key)
         assert DAY.total_seconds() * 1000 - 5000 < remaining_ms <= DAY.total_seconds() * 1000
@@ -111,11 +135,30 @@ async def test_only_the_first_try_may_start_a_reply(
     memory = SessionMemory(ingestion_redis, lifetime=DAY, max_messages=20)
     receipt_id, other_receipt_id = uuid.uuid4(), uuid.uuid4()
 
-    assert not await memory.reply_started(user_id, receipt_id)
+    assert await memory.reply(user_id, receipt_id) is None
     assert await memory.start_reply(user_id, receipt_id)
     assert not await memory.start_reply(user_id, receipt_id)
-    assert await memory.reply_started(user_id, receipt_id)
-    assert not await memory.reply_started(user_id, other_receipt_id)
+    assert await memory.reply(user_id, receipt_id) == Reply(ReplyState.SENDING)
+    assert await memory.reply(user_id, other_receipt_id) is None
+
+
+async def test_a_reply_goes_from_sending_to_delivered_to_stored_with_its_exchange(
+    ingestion_redis: ArqRedis, user_id: uuid.UUID
+) -> None:
+    memory = SessionMemory(ingestion_redis, lifetime=DAY, max_messages=20)
+    receipt_id = uuid.uuid4()
+    sent = exchange(1, 2, results=working_set(uuid.uuid4(), uuid.uuid4()))
+    await memory.start_reply(user_id, receipt_id)
+
+    await memory.reply_delivered(user_id, receipt_id, sent)
+    assert await memory.reply(user_id, receipt_id) == Reply(ReplyState.DELIVERED, sent)
+    assert (await memory.load(user_id)).history == ()
+
+    await memory.remember(user_id, receipt_id, sent)
+    assert await memory.reply(user_id, receipt_id) == Reply(ReplyState.STORED)
+    assert await memory.load(user_id) == Session(
+        history=(message(1), message(2)), working_set=sent.working_set
+    )
 
 
 async def test_erasing_a_user_removes_their_session_and_no_one_elses(
@@ -124,7 +167,7 @@ async def test_erasing_a_user_removes_their_session_and_no_one_elses(
     memory = SessionMemory(ingestion_redis, lifetime=DAY, max_messages=20)
     other_user_id = uuid.uuid4()
     for someone in (user_id, other_user_id):
-        await memory.remember(someone, [message(1)], working_set(uuid.uuid4()))
+        await remember(memory, someone, [1], working_set(uuid.uuid4()))
         await memory.start_reply(someone, uuid.uuid4())
 
     try:

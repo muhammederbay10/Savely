@@ -247,7 +247,9 @@ async def start_worker(ctx: JobContext) -> None:
     sender = AnswerSender(InstagramMessenger(messenger_http, get_messenger_settings()))
     ctx[_RESOURCES] = ChatWorkerResources(
         responder=ChatResponder(
-            payloads=ChatPayloads(redis),
+            payloads=ChatPayloads(
+                RedisIngestionState(redis, timedelta(seconds=settings.ingestion_state_ttl_seconds))
+            ),
             memory=session_memory(redis, chat_settings),
             conversations=ConversationStore(sessions),
             agent=ResponseAgent(
@@ -259,6 +261,8 @@ async def start_worker(ctx: JobContext) -> None:
             toolbox=toolbox,
             sender=sender,
             run_deadline_seconds=chat_settings.chat_run_deadline_seconds,
+            store_tries=chat_settings.chat_max_tries,
+            store_retry_delay_seconds=chat_settings.chat_retry_delay_seconds,
         ),
         max_tries=chat_settings.chat_max_tries,
         retry_delay_seconds=chat_settings.chat_retry_delay_seconds,

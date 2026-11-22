@@ -22,6 +22,7 @@ async def send_answer(
     recipient_id: str,
     answer: AgentAnswer,
     last_user_message_at: datetime,
+    last_message_number: int,
 ) -> DeliveryReport:
     """Send an answer; record a deletion question as delivered once all of it was sent.
 
@@ -33,6 +34,8 @@ async def send_answer(
             `answer.deleted_recipients`, read before the user's rows were deleted.
         answer: The agent's answer.
         last_user_message_at: When the user last wrote, as the platform reported it.
+        last_message_number: The number of the user's last message, read
+            before sending; a deletion question waits for the one after it.
 
     Returns:
         What was sent.
@@ -43,5 +46,7 @@ async def send_answer(
     """
     report = await sender.send(recipient_id, answer.messages, last_user_message_at)
     if answer.deletion_confirmation is not None and report.complete:
-        await toolbox.confirmation_delivered(user_id, answer.deletion_confirmation)
+        await toolbox.confirmation_delivered(
+            user_id, answer.deletion_confirmation, last_message_number
+        )
     return report

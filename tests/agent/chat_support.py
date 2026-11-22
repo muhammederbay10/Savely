@@ -11,7 +11,7 @@ import json
 import uuid
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -20,7 +20,7 @@ from arq.connections import ArqRedis
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.adapters.base import ChatMessage
+from app.adapters.base import CaptureEvent, ChatMessage
 from app.agent.chat import ChatPayloads, ChatResponder
 from app.agent.deletion_requests import RedisDeletionRequests
 from app.agent.replies.answers import AnswerSender
@@ -34,7 +34,7 @@ from app.db.models import (
     User,
 )
 from app.ingestion.erasure import IngestionDataEraser
-from app.ingestion.jobs import CHAT_QUEUE, ArqJobQueue
+from app.ingestion.jobs import CHAT_QUEUE, INDEXING_QUEUE, ArqJobQueue
 from app.ingestion.service import IngestionService
 from app.ingestion.session_state import RedisIngestionState
 from app.memory.conversation import ConversationStore
@@ -52,6 +52,8 @@ HINT_WINDOW = timedelta(seconds=30)
 SESSION_LIFETIME = timedelta(hours=24)
 HISTORY_MESSAGES = 20
 RUN_DEADLINE_SECONDS = 10.0
+STORE_TRIES = 2
+STORE_RETRY_DELAY_SECONDS = 1.0
 # Plenty of successful Send API answers for one test's conversation.
 SEND_ANSWERS = 40
 # Texts are sent within Instagram's 24-hour window of the mock Send API's clock.
@@ -73,6 +75,7 @@ class ChatStores:
     ingestion: IngestionService
     texts_sent: int = 0
     users: list[uuid.UUID] = field(default_factory=list)
+    delivered: dict[uuid.UUID, ChatMessage] = field(default_factory=dict)
 
     def outside_postgres(self) -> list[UserDataOutsidePostgres]:
         """The stores the chat worker's eraser erases, as `app.agent.worker` builds it."""
@@ -93,19 +96,50 @@ class ChatStores:
         self, user_id: uuid.UUID, text: str, *, quick_reply_payload: str | None = None
     ) -> uuid.UUID:
         """The user writes to the bot; ingestion queues the chat job. Returns its receipt id."""
-        message_id = f"mid-synthetic-{uuid.uuid4().hex}"
-        await self.ingestion.ingest_chat_message(
-            ChatMessage(
+        message = ChatMessage(
+            user_id=user_id,
+            platform=INSTAGRAM,
+            text=text,
+            message_id=f"mid-synthetic-{uuid.uuid4().hex}",
+            received_at=self._next_send_time(),
+            quick_reply_payload=quick_reply_payload,
+        )
+        receipt_id = await self._ingest(message)
+        self.delivered[receipt_id] = message
+        return receipt_id
+
+    async def deliver_again(self, receipt_id: uuid.UUID) -> uuid.UUID:
+        """Meta delivers a text it already delivered once. Returns the receipt id ingestion uses."""
+        return await self._ingest(self.delivered[receipt_id])
+
+    async def share(self, user_id: uuid.UUID) -> None:
+        """The user shares a reel with the bot, as a message of its own."""
+        marker = uuid.uuid4().hex
+        await self.ingestion.ingest_capture(
+            CaptureEvent(
                 user_id=user_id,
                 platform=INSTAGRAM,
-                text=text,
-                message_id=message_id,
-                received_at=FIRST_TEXT_AT + timedelta(minutes=self.texts_sent),
-                quick_reply_payload=quick_reply_payload,
+                source="dm",
+                post_url=None,
+                platform_post_id=None,
+                caption=None,
+                media_url=f"https://lookaside.example.test/ig_messaging_cdn/?asset_id={marker}",
+                media_type="reel",
+                collection_hint=None,
+                source_message_id=f"mid-synthetic-share-{marker}",
+                received_at=self._next_send_time(),
             )
         )
+
+    def _next_send_time(self) -> datetime:
+        # A minute apart: longer than the collection-hint window, so a text is chat.
+        sent_at = FIRST_TEXT_AT + timedelta(minutes=self.texts_sent)
         self.texts_sent += 1
-        receipt = await self.state.text_receipt(user_id, INSTAGRAM, message_id)
+        return sent_at
+
+    async def _ingest(self, message: ChatMessage) -> uuid.UUID:
+        await self.ingestion.ingest_chat_message(message)
+        receipt = await self.state.text_receipt(message.user_id, INSTAGRAM, message.message_id)
         assert receipt is not None
         return receipt.id
 
@@ -115,7 +149,11 @@ class ChatStores:
             await self.requests.erase_user(user_id, ())
             await self.memory.erase_user(user_id, ())
         users = {str(user_id) for user_id in self.users}
-        queued = await self.redis.queued_jobs(queue_name=CHAT_QUEUE)
+        queued = [
+            job
+            for queue in (CHAT_QUEUE, INDEXING_QUEUE)
+            for job in await self.redis.queued_jobs(queue_name=queue)
+        ]
         await self.jobs.discard([job.job_id for job in queued if job.kwargs["user_id"] in users])
 
 
@@ -150,6 +188,7 @@ async def chat_stores(
 class ChatUnderTest:
     responder: ChatResponder
     agent: AgentUnderTest
+    sender: AnswerSender
     send_api: RecordingSendApi
 
     def sent_texts(self) -> list[str]:
@@ -157,6 +196,10 @@ class ChatUnderTest:
 
     def sent_bodies(self) -> list[dict[str, dict[str, object]]]:
         return [json.loads(request.content) for request in self.send_api.requests]
+
+
+async def no_wait(seconds: float) -> None:
+    """Waits between attempts to store take no time in tests."""
 
 
 def build_chat(
@@ -176,17 +219,21 @@ def build_chat(
         **agent_settings,
     )
     messenger = build_messenger(send_answers or [sent() for _ in range(SEND_ANSWERS)])
+    sender = AnswerSender(messenger.messenger)
     responder = ChatResponder(
-        payloads=ChatPayloads(stores.redis),
+        payloads=ChatPayloads(stores.state),
         memory=stores.memory,
         conversations=ConversationStore(stores.sessions),
         agent=agent.agent,
         toolbox=agent.toolbox,
-        sender=AnswerSender(messenger.messenger),
+        sender=sender,
         run_deadline_seconds=RUN_DEADLINE_SECONDS,
+        store_tries=STORE_TRIES,
+        store_retry_delay_seconds=STORE_RETRY_DELAY_SECONDS,
         now=stores.clock,
+        sleep=no_wait,
     )
-    return ChatUnderTest(responder=responder, agent=agent, send_api=messenger.api)
+    return ChatUnderTest(responder=responder, agent=agent, sender=sender, send_api=messenger.api)
 
 
 async def seed_place(

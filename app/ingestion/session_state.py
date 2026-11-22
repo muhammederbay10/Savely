@@ -1,8 +1,8 @@
 """What ingestion keeps in Redis about a user's recent messages.
 
-Three keys per user, named `savely:ingestion:<user id>:<name>`, hold
+Four keys per user, named `savely:ingestion:<user id>:<name>`, hold
 everything ingestion writes to Redis about a user, so "delete my data" can
-erase it by deleting three keys:
+erase it by deleting four keys:
 
 | Name | Type | Entries |
 |---|---|---|
@@ -10,6 +10,14 @@ erase it by deleting three keys:
 | | | `chat:<receipt id>`: the `ChatMessage` a chat job answers |
 | `receipts` | hash | `<platform>:<message id>`: how a text was routed (`TextReceipt`) |
 | `shares` | sorted set | the user's recent shares (`RecordedShare`), scored by send time |
+| `messages` | string | the number of the last message ingestion took in from the user |
+
+**Message numbers.** Every new message, a share or a text, gets the next
+number (`number_message`); a repeated delivery keeps the number of its first
+delivery (the text's receipt holds it). A deletion question waits for one
+message number: the next one after the question was sent
+(`app.agent.deletion_requests`), so a message in between, in whatever order the
+jobs run, leaves the question unconfirmable.
 
 The jobs on the queue carry only ids. A worker reads the payload from here, and
 finds nothing once the user is deleted.
@@ -39,6 +47,7 @@ _KEY_PREFIX = "savely:ingestion"
 _PAYLOADS = "payloads"
 _RECEIPTS = "receipts"
 _SHARES = "shares"
+_MESSAGES = "messages"
 _MILLISECONDS_PER_SECOND = 1000
 _CAPTURE_PAYLOAD_PREFIX = "capture"
 _CHAT_PAYLOAD_PREFIX = "chat"
@@ -56,6 +65,7 @@ class TextReceipt(BaseModel):
 
     Attributes:
         id: The receipt's own id. The chat job and its payload are named after it.
+        number: The text's number among the user's messages (`number_message`).
         route: Where the text went.
         saved_item_id: The item the text labels, for a collection hint.
         chat_queued: Whether the chat job was queued, for a chat message.
@@ -64,6 +74,7 @@ class TextReceipt(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     id: uuid.UUID
+    number: int
     route: TextRoute
     saved_item_id: uuid.UUID | None
     chat_queued: bool
@@ -142,6 +153,56 @@ class RedisIngestionState:
         """
         field = chat_payload_field(receipt_id)
         await self._write(user_id, _PAYLOADS, field, message.model_dump_json())
+
+    async def chat_payload(self, user_id: uuid.UUID, receipt_id: uuid.UUID) -> ChatMessage | None:
+        """Return the chat message a chat job answers, if it is still kept.
+
+        Args:
+            user_id: The user who wrote the text.
+            receipt_id: The id of the text's receipt.
+
+        Returns:
+            The message; `None` when the user was deleted or it outlived its lifetime.
+
+        Raises:
+            redis.exceptions.RedisError: If Redis cannot be reached.
+        """
+        value = await self._hget(_key(user_id, _PAYLOADS), chat_payload_field(receipt_id))
+        return None if value is None else ChatMessage.model_validate_json(value)
+
+    async def number_message(self, user_id: uuid.UUID) -> int:
+        """Give a new message of the user the next number.
+
+        Args:
+            user_id: The user who sent the message.
+
+        Returns:
+            The message's number, from 1.
+
+        Raises:
+            redis.exceptions.RedisError: If Redis cannot be reached.
+        """
+        key = _key(user_id, _MESSAGES)
+        async with self._redis.pipeline(transaction=True) as pipeline:
+            pipeline.incr(key)
+            pipeline.expire(key, self._lifetime)
+            number, _ = await pipeline.execute()
+        return int(number)
+
+    async def last_message_number(self, user_id: uuid.UUID) -> int:
+        """Return the number of the user's last message, 0 if none is known.
+
+        Args:
+            user_id: The user.
+
+        Returns:
+            The number `number_message` gave last.
+
+        Raises:
+            redis.exceptions.RedisError: If Redis cannot be reached.
+        """
+        value = await cast(Awaitable[bytes | None], self._redis.get(_key(user_id, _MESSAGES)))
+        return 0 if value is None else int(value)
 
     async def record_share(
         self, user_id: uuid.UUID, platform: str, saved_item_id: uuid.UUID, sent_at: datetime
@@ -277,7 +338,7 @@ class RedisIngestionState:
             await pipeline.execute()
 
 
-_ALL_KEY_NAMES = (_PAYLOADS, _RECEIPTS, _SHARES)
+_ALL_KEY_NAMES = (_PAYLOADS, _RECEIPTS, _SHARES, _MESSAGES)
 
 
 def payloads_key(user_id: uuid.UUID) -> str:

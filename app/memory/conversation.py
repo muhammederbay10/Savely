@@ -8,17 +8,28 @@ as `user.language`, which the save confirmations use (ARCHITECTURE §3.7).
 The home area and the country are set by the response agent's `set_profile`
 tool when the user tells them. Every row and column here belongs to the user
 and is deleted with the `user` row by "delete my data".
+
+**Holding the user** (`hold`). The chat worker sends an answer and writes the
+exchange anywhere only inside `hold`: a transaction that holds the user's row
+with `FOR KEY SHARE`. "Delete my data" locks the same row `FOR UPDATE`, so it
+waits until the block ends and then erases what the block wrote; a block that
+starts after the erasure finds no user and writes nothing. `FOR KEY SHARE`
+doesn't make ingestion wait, nor another answer of the same user.
+
+An exchange's rows get ids made from the message's receipt and their place in
+the exchange, so storing the same exchange again adds nothing.
 """
 
 import uuid
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
 from sqlalchemy import select, update
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.db.models import ConversationMessage, PlatformAccount, User
-from app.ingestion.repository import lock_user
 from app.memory.session import SessionMessage
 
 
@@ -85,35 +96,75 @@ class ConversationStore:
             recipient_id=recipient_id, country=country, home_area=home_area, language=language
         )
 
-    async def record(
-        self, user_id: uuid.UUID, messages: Sequence[SessionMessage], language: str | None
-    ) -> bool:
-        """Store an exchange in `conversation_msg`, and the language the user wrote in.
+    @asynccontextmanager
+    async def hold(self, user_id: uuid.UUID) -> AsyncIterator["HeldUser | None"]:
+        """Hold the user's row until the block ends, so "delete my data" waits for it.
 
         Args:
             user_id: The DM's sender.
+
+        Yields:
+            The held user, to store the exchange with; `None` if the user was
+            deleted, and then nothing may be sent or written for them.
+
+        Raises:
+            sqlalchemy.exc.SQLAlchemyError: If the database failed; what the
+                block wrote to Postgres is rolled back.
+        """
+        async with self._sessions() as session, session.begin():
+            held = await session.execute(
+                select(User.id).where(User.id == user_id).with_for_update(read=True, key_share=True)
+            )
+            yield None if held.scalar_one_or_none() is None else HeldUser(session, user_id)
+
+
+class HeldUser:
+    """A user whose row `ConversationStore.hold` holds; writes commit when the block ends."""
+
+    def __init__(self, session: AsyncSession, user_id: uuid.UUID) -> None:
+        """Wrap the holding transaction; use `ConversationStore.hold`.
+
+        Args:
+            session: The session whose transaction holds the user's row.
+            user_id: The user.
+        """
+        self._session = session
+        self._user_id = user_id
+
+    async def record(
+        self, receipt_id: uuid.UUID, messages: Sequence[SessionMessage], language: str | None
+    ) -> None:
+        """Store an exchange in `conversation_msg`, and the language the user wrote in.
+
+        Storing the same exchange again adds no row.
+
+        Args:
+            receipt_id: The receipt of the message the exchange answers.
             messages: The messages, oldest first.
             language: The BCP 47 tag of the user's language in this exchange;
                 `None` leaves `user.language` as it is.
 
-        Returns:
-            Whether it was stored; `False` if the user was deleted meanwhile.
-
         Raises:
             sqlalchemy.exc.SQLAlchemyError: If the database failed.
         """
-        async with self._sessions() as session, session.begin():
-            # Holds "delete my data" off until the rows are in, or finds the user gone.
-            if not await lock_user(session, user_id):
-                return False
-            session.add_all(
-                ConversationMessage(
-                    user_id=user_id, role=message.role, content=message.content, at=message.at
+        if messages:
+            await self._session.execute(
+                insert(ConversationMessage)
+                .values(
+                    [
+                        {
+                            "id": uuid.uuid5(receipt_id, str(position)),
+                            "user_id": self._user_id,
+                            "role": message.role,
+                            "content": message.content,
+                            "at": message.at,
+                        }
+                        for position, message in enumerate(messages)
+                    ]
                 )
-                for message in messages
+                .on_conflict_do_nothing(index_elements=[ConversationMessage.id])
             )
-            if language is not None:
-                await session.execute(
-                    update(User).where(User.id == user_id).values(language=language)
-                )
-        return True
+        if language is not None:
+            await self._session.execute(
+                update(User).where(User.id == self._user_id).values(language=language)
+            )

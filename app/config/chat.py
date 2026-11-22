@@ -25,9 +25,11 @@ class ChatSettings(BaseSettings):
         chat_concurrency: How many messages one chat worker answers at once
             (`CHAT_CONCURRENCY`).
         chat_max_tries: How often one message's job runs before the bot sends
-            the error message instead (`CHAT_MAX_TRIES`).
+            the error message instead (`CHAT_MAX_TRIES`); also how often one
+            run tries to store an answer it sent.
         chat_retry_delay_seconds: The wait before a failed job runs again,
-            times the number of the try (`CHAT_RETRY_DELAY_SECONDS`).
+            times the number of the try (`CHAT_RETRY_DELAY_SECONDS`); also
+            the wait between attempts to store, times the attempt.
         chat_run_deadline_seconds: How long one try may take to prepare an
             answer, before anything is sent (`CHAT_RUN_DEADLINE_SECONDS`).
             Sending is never cut off: a message cut off mid-way may have

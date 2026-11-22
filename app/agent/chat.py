@@ -2,36 +2,49 @@
 
 For each text the user wrote to the bot:
 
-1. Read the message from ingestion's payloads in Redis; no payload means the
-   user was deleted, and the job stops.
+1. Read the message and its number from ingestion's state in Redis; no
+   message means the user was deleted, and the job stops.
 2. Load the sender's profile (their platform id, country and home area) and
    their short-term memory (the last messages and the working set).
 3. Run the response agent for that user only. The user comes from the DM's
    sender, never from the model. `AgentTurn.deletion_confirmed` is set only
    when the message is a tap on the "Yes, delete" button
-   (`confirms_deletion`); the tools still check that it is the sender's next
-   message after a delivered question, so a typed "yes", a later tap or
+   (`confirms_deletion`), and `AgentTurn.message_number` lets only the
+   sender's next message after a delivered question confirm it. A typed
+   "yes", a tap after another message (whatever order the jobs run in) or
    another user's tap deletes nothing.
 4. Send the answer (`app.agent.send.send_answer`) within the 24-hour window,
    counted from when the user sent this message.
-5. Store the exchange and the new working set (`app/memory/session.py`), the
-   messages in `conversation_msg` and the user's language
-   (`app/memory/conversation.py`). Nothing is stored after a deletion.
+5. Store the exchange: the messages and the new working set in short-term
+   memory (`app/memory/session.py`), the messages in `conversation_msg` and
+   the user's language (`app/memory/conversation.py`).
 
-**Retries.** Steps 1 to 3 have `CHAT_RUN_DEADLINE_SECONDS`. A failure there
-that may pass later (a model outage, the deadline, Redis or the database)
-raises `RetryLaterError`, and the worker tries the job again; on the last
-try the bot sends its error message instead. A failure that would happen
+**"Delete my data" never races an answer.** Step 4 and every write of step 5
+run inside `ConversationStore.hold`, which holds the user's row the erasure
+locks too, and only if the user still exists. An answer whose user was
+deleted before it got there is not sent and stores nothing; an erasure that
+starts while an answer is being sent or stored waits for it, then erases what
+it stored. Only the "done" message after a deletion is sent without the user,
+to the recipients read before the erasure.
+
+**Retries before sending.** Steps 1 to 3 have `CHAT_RUN_DEADLINE_SECONDS`. A
+failure there that may pass later (a model outage, the deadline, Redis or the
+database) raises `RetryLaterError`, and the worker tries the job again; on the
+last try the bot sends its error message instead. A failure that would happen
 again (a rejected request, an unusable answer) sends the error message at
-once. A deletion request is used up by the first try that ran the agent, so
-a "Yes, delete" tap that hits a failure deletes nothing: the user asks again.
+once. A deletion request is used up by the first try that ran the agent, so a
+"Yes, delete" tap that hits a failure deletes nothing: the user asks again.
 
-**Never sent twice.** Right before sending, the job marks the message as
-answered in short-term memory (`SessionMemory.start_reply`). A later try of
-the same job that finds the mark sends nothing, because some of the answer may
-already have arrived. A send that fails is logged and not tried again. The
-"done" message after a deletion sets no mark, so nothing is written for the
-deleted user; the erasure removed the message, so a later try stops anyway.
+**Never sent twice, always stored.** Right before sending, the job marks the
+reply as being sent (`SessionMemory.start_reply`). A later try that finds that
+mark sends nothing, because some of the answer may already have arrived; a
+send that fails is logged and not tried again. Once the answer was sent, the
+mark keeps the exchange as delivered, and storing it is tried up to
+`CHAT_MAX_TRIES` times, `CHAT_RETRY_DELAY_SECONDS` times the attempt apart.
+Each write can be repeated without doubling anything, and the last one marks
+the reply as stored. If the stores stay down, the job's next try finds the
+delivered exchange and only stores it, without running the agent or sending
+again; the last try gives up and logs it.
 """
 
 import asyncio
@@ -41,15 +54,14 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Final, cast
+from typing import Final
 
-from redis.asyncio import Redis
 from redis.exceptions import RedisError
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.adapters.base import ChatMessage
 from app.agent.agent import AgentAnswer, AgentError, AgentTurn, ResponseAgent
-from app.agent.replies.answers import AnswerMessages, AnswerSender
+from app.agent.replies.answers import AnswerMessages, AnswerSender, DeliveryReport
 from app.agent.replies.messenger import MessengerError
 from app.agent.replies.templates import (
     ReplyWording,
@@ -59,9 +71,16 @@ from app.agent.replies.templates import (
 )
 from app.agent.send import send_answer
 from app.agent.tools import Toolbox
-from app.ingestion.session_state import chat_payload_field, payloads_key
+from app.ingestion.session_state import RedisIngestionState
 from app.memory.conversation import ChatProfile, ConversationStore
-from app.memory.session import Session, SessionMemory, SessionMessage, WorkingSet
+from app.memory.session import (
+    Exchange,
+    ReplyState,
+    Session,
+    SessionMemory,
+    SessionMessage,
+    WorkingSet,
+)
 from app.models.base import Message
 from app.models.errors import ModelError, ModelRateLimitError, ModelUnavailableError
 from app.pipeline.steps.confirm import FALLBACK_LANGUAGE
@@ -79,6 +98,8 @@ RETRYABLE_ERRORS: Final = (
 )
 # Failures that would happen again: the bot apologizes at once.
 FINAL_ERRORS: Final = (AgentError, ModelError)
+# Failures of the stores after sending: storing the exchange is tried again.
+STORE_ERRORS: Final = (RedisError, SQLAlchemyError)
 
 
 class ChatOutcome(StrEnum):
@@ -91,29 +112,43 @@ class ChatOutcome(StrEnum):
     ALREADY_SENT = "already_sent"
     SEND_FAILED = "send_failed"
     FAILED = "failed"
+    NOT_STORED = "not_stored"
 
 
 class RetryLaterError(Exception):
-    """Preparing the answer failed in a way that may pass; the worker tries again."""
+    """The job failed in a way that may pass; the worker tries it again."""
 
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
-class ChatPayloads:
-    """Reads the chat message a job answers, from ingestion's per-user payloads hash."""
+@dataclass(frozen=True)
+class ReceivedMessage:
+    """A chat message with its number among the sender's messages.
 
-    def __init__(self, redis: Redis) -> None:
+    Attributes:
+        message: The message.
+        number: Its number, given by ingestion in the order messages arrived.
+    """
+
+    message: ChatMessage
+    number: int
+
+
+class ChatPayloads:
+    """Reads the chat message a job answers, from ingestion's state in Redis."""
+
+    def __init__(self, state: RedisIngestionState) -> None:
         """Create the reader.
 
         Args:
-            redis: The Redis client ingestion writes to.
+            state: Ingestion's per-user state.
         """
-        self._redis = redis
+        self._state = state
 
-    async def message(self, user_id: uuid.UUID, receipt_id: uuid.UUID) -> ChatMessage | None:
-        """Return the message of a chat job, if it is still kept.
+    async def message(self, user_id: uuid.UUID, receipt_id: uuid.UUID) -> ReceivedMessage | None:
+        """Return the message of a chat job and its number, if they are still kept.
 
         Args:
             user_id: The sender.
@@ -125,11 +160,25 @@ class ChatPayloads:
         Raises:
             redis.exceptions.RedisError: If Redis cannot be reached.
         """
-        value = await cast(
-            Awaitable[bytes | None],
-            self._redis.hget(payloads_key(user_id), chat_payload_field(receipt_id)),
-        )
-        return None if value is None else ChatMessage.model_validate_json(value)
+        message = await self._state.chat_payload(user_id, receipt_id)
+        if message is None:
+            return None
+        receipt = await self._state.text_receipt(user_id, message.platform, message.message_id)
+        return None if receipt is None else ReceivedMessage(message, receipt.number)
+
+    async def last_message_number(self, user_id: uuid.UUID) -> int:
+        """Return the number of the sender's last message, 0 if none is known.
+
+        Args:
+            user_id: The sender.
+
+        Returns:
+            The number.
+
+        Raises:
+            redis.exceptions.RedisError: If Redis cannot be reached.
+        """
+        return await self._state.last_message_number(user_id)
 
 
 @dataclass(frozen=True)
@@ -138,7 +187,7 @@ class _Prepared:
 
     user_id: uuid.UUID
     receipt_id: uuid.UUID
-    message: ChatMessage
+    received: ReceivedMessage
     profile: ChatProfile
     session: Session
 
@@ -156,20 +205,33 @@ class ChatResponder:
         toolbox: Toolbox,
         sender: AnswerSender,
         run_deadline_seconds: float,
+        store_tries: int,
+        store_retry_delay_seconds: float,
         now: Callable[[], datetime] = _utc_now,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         """Create the responder.
 
         Args:
             payloads: Reads the message of a job.
             memory: Short-term memory: history, working set, reply marks.
-            conversations: The profile and `conversation_msg`.
+            conversations: The profile and `conversation_msg`, and the hold on the user.
             agent: The response agent.
             toolbox: The agent's tools, to record a delivered deletion question.
             sender: Sends an answer.
             run_deadline_seconds: `CHAT_RUN_DEADLINE_SECONDS`.
+            store_tries: How often one try stores a sent exchange before it
+                gives up (`CHAT_MAX_TRIES`).
+            store_retry_delay_seconds: The wait before storing again, times the
+                attempt (`CHAT_RETRY_DELAY_SECONDS`).
             now: The clock, for the time of the bot's reply.
+            sleep: Waits between attempts to store.
+
+        Raises:
+            ValueError: If `store_tries` is below 1.
         """
+        if store_tries < 1:
+            raise ValueError("store_tries must be at least 1")
         self._payloads = payloads
         self._memory = memory
         self._conversations = conversations
@@ -177,7 +239,10 @@ class ChatResponder:
         self._toolbox = toolbox
         self._sender = sender
         self._run_deadline_seconds = run_deadline_seconds
+        self._store_tries = store_tries
+        self._store_retry_delay_seconds = store_retry_delay_seconds
         self._now = now
+        self._sleep = sleep
 
     async def respond(
         self, user_id: uuid.UUID, receipt_id: uuid.UUID, *, last_try: bool
@@ -193,73 +258,114 @@ class ChatResponder:
             What happened.
 
         Raises:
-            RetryLaterError: If preparing the answer failed in a way that may
-                pass, and this is not the last try.
-            redis.exceptions.RedisError: If Redis failed after the answer was sent.
-            sqlalchemy.exc.SQLAlchemyError: If the database failed after the
-                answer was sent.
+            RetryLaterError: If preparing the answer, or storing it once sent,
+                failed in a way that may pass, and this is not the last try.
         """
-        prepared: _Prepared | ChatOutcome | None = None
+        deadline = asyncio.get_running_loop().time() + self._run_deadline_seconds
         try:
-            async with asyncio.timeout(self._run_deadline_seconds):
-                prepared = await self._prepare(user_id, receipt_id)
-                if isinstance(prepared, ChatOutcome):
-                    return prepared
-                answer = await self._agent.answer(_turn(prepared))
+            async with asyncio.timeout_at(deadline):
+                step = await self._prepare(user_id, receipt_id)
         except RETRYABLE_ERRORS as error:
-            if not last_try:
-                logger.warning("chat_answer_retry", extra={"error": type(error).__name__})
-                raise RetryLaterError(type(error).__name__) from error
-            return await self._fail(prepared, error)
+            return await self._retry_or_fail(None, error, last_try=last_try)
+        if isinstance(step, ChatOutcome):
+            return step
+        if isinstance(step, Exchange):
+            # An earlier try sent the answer; only storing it is left.
+            return await self._store(user_id, receipt_id, step, last_try=last_try)
+        try:
+            async with asyncio.timeout_at(deadline):
+                answer = await self._agent.answer(_turn(step))
+        except RETRYABLE_ERRORS as error:
+            return await self._retry_or_fail(step, error, last_try=last_try)
         except FINAL_ERRORS as error:
-            return await self._fail(prepared, error)
-        return await self._deliver(prepared, answer)
+            return await self._fail(step, error)
+        return await self._deliver(step, answer, last_try=last_try)
 
-    async def _prepare(self, user_id: uuid.UUID, receipt_id: uuid.UUID) -> _Prepared | ChatOutcome:
-        message = await self._payloads.message(user_id, receipt_id)
-        if message is None:
+    async def _prepare(
+        self, user_id: uuid.UUID, receipt_id: uuid.UUID
+    ) -> _Prepared | Exchange | ChatOutcome:
+        received = await self._payloads.message(user_id, receipt_id)
+        if received is None:
             return ChatOutcome.NO_MESSAGE
-        if await self._memory.reply_started(user_id, receipt_id):
+        reply = await self._memory.reply(user_id, receipt_id)
+        if reply is not None:
+            if reply.state is ReplyState.DELIVERED and reply.exchange is not None:
+                return reply.exchange
             return ChatOutcome.ALREADY_SENT
-        profile = await self._conversations.profile(user_id, message.platform)
+        profile = await self._conversations.profile(user_id, received.message.platform)
         if profile is None:
             return ChatOutcome.NO_USER
         session = await self._memory.load(user_id)
-        return _Prepared(user_id, receipt_id, message, profile, session)
+        return _Prepared(user_id, receipt_id, received, profile, session)
 
-    async def _deliver(self, prepared: _Prepared, answer: AgentAnswer) -> ChatOutcome:
-        # After a deletion nothing may be written for the user again; a later try
-        # finds no message, because the erasure removed it.
-        if not answer.deleted_recipients and not await self._memory.start_reply(
-            prepared.user_id, prepared.receipt_id
-        ):
-            return ChatOutcome.ALREADY_SENT
+    async def _retry_or_fail(
+        self, prepared: _Prepared | None, error: Exception, *, last_try: bool
+    ) -> ChatOutcome:
+        if not last_try:
+            logger.warning("chat_answer_retry", extra={"error": type(error).__name__})
+            raise RetryLaterError(type(error).__name__) from error
+        return await self._fail(prepared, error)
+
+    async def _deliver(
+        self, prepared: _Prepared, answer: AgentAnswer, *, last_try: bool
+    ) -> ChatOutcome:
+        if answer.deleted_recipients:
+            return await self._send_after_deletion(prepared, answer)
         try:
-            report = await send_answer(
+            sent = await self._send(prepared, answer)
+        except RETRYABLE_ERRORS as error:
+            # A later try answers, or finds the reply mark and sends nothing.
+            return await self._retry_or_fail(prepared, error, last_try=last_try)
+        if isinstance(sent, ChatOutcome):
+            return sent
+        exchange = self._exchange(prepared, answer, sent_whole=sent.complete)
+        return await self._store(prepared.user_id, prepared.receipt_id, exchange, last_try=last_try)
+
+    async def _send(self, prepared: _Prepared, answer: AgentAnswer) -> DeliveryReport | ChatOutcome:
+        """Send the answer while holding the user, unless they were deleted or it was sent."""
+        async with self._conversations.hold(prepared.user_id) as held:
+            if held is None:
+                return ChatOutcome.NO_USER
+            if not await self._memory.start_reply(prepared.user_id, prepared.receipt_id):
+                return ChatOutcome.ALREADY_SENT
+            # Read before sending: a message that arrives while the question is
+            # on its way is the next one, and only a tap there can confirm it.
+            last_message_number = await self._payloads.last_message_number(prepared.user_id)
+            try:
+                return await send_answer(
+                    self._sender,
+                    self._toolbox,
+                    prepared.user_id,
+                    prepared.profile.recipient_id,
+                    answer,
+                    prepared.received.message.received_at,
+                    last_message_number,
+                )
+            except MessengerError as error:
+                logger.warning("chat_answer_send_failed", extra={"error": type(error).__name__})
+                return ChatOutcome.SEND_FAILED
+
+    async def _send_after_deletion(self, prepared: _Prepared, answer: AgentAnswer) -> ChatOutcome:
+        """Send the "done" message; the user is gone, so nothing is held, marked or stored."""
+        try:
+            await send_answer(
                 self._sender,
                 self._toolbox,
                 prepared.user_id,
                 prepared.profile.recipient_id,
                 answer,
-                prepared.message.received_at,
+                prepared.received.message.received_at,
+                prepared.received.number,
             )
         except MessengerError as error:
             logger.warning("chat_answer_send_failed", extra={"error": type(error).__name__})
             return ChatOutcome.SEND_FAILED
-        if answer.deleted_recipients:
-            # The user is gone, with their short-term memory and messages.
-            return ChatOutcome.ANSWERED
-        await self._remember(prepared, answer, sent_whole=report.complete)
-        return ChatOutcome.ANSWERED if report.complete else ChatOutcome.OUTSIDE_REPLY_WINDOW
+        return ChatOutcome.ANSWERED
 
-    async def _remember(
-        self, prepared: _Prepared, answer: AgentAnswer, *, sent_whole: bool
-    ) -> None:
-        """Keep the exchange; an answer cut off by the closed window keeps only the user's text."""
-        user_message = SessionMessage(
-            role="user", content=prepared.message.text, at=prepared.message.received_at
-        )
-        messages = [user_message]
+    def _exchange(self, prepared: _Prepared, answer: AgentAnswer, *, sent_whole: bool) -> Exchange:
+        """The exchange to keep; an answer the closed window cut off keeps the user's text only."""
+        message = prepared.received.message
+        messages = [SessionMessage(role="user", content=message.text, at=message.received_at)]
         working_set: WorkingSet | None = None
         if sent_whole:
             messages.append(
@@ -271,45 +377,98 @@ class ChatResponder:
                     shown=len(answer.messages.results),
                     searches=answer.searches,
                 )
-        await self._memory.remember(prepared.user_id, messages, working_set)
-        await self._conversations.record(prepared.user_id, messages, answer.language)
+        return Exchange(
+            messages=tuple(messages),
+            working_set=working_set,
+            language=answer.language,
+            sent_whole=sent_whole,
+        )
 
-    async def _fail(
-        self, prepared: _Prepared | ChatOutcome | None, error: Exception
+    async def _store(
+        self, user_id: uuid.UUID, receipt_id: uuid.UUID, exchange: Exchange, *, last_try: bool
     ) -> ChatOutcome:
+        """Store a sent exchange, trying again after a failure; never send anything."""
+        for attempt in range(1, self._store_tries + 1):
+            try:
+                await self._store_once(user_id, receipt_id, exchange)
+            except STORE_ERRORS as error:
+                logger.warning(
+                    "chat_exchange_store_failed",
+                    extra={"error": type(error).__name__, "attempt": attempt},
+                )
+                if attempt < self._store_tries:
+                    await self._sleep(self._store_retry_delay_seconds * attempt)
+            else:
+                return (
+                    ChatOutcome.ANSWERED
+                    if exchange.sent_whole
+                    else ChatOutcome.OUTSIDE_REPLY_WINDOW
+                )
+        if not last_try:
+            raise RetryLaterError("the sent exchange is not stored yet")
+        logger.error("chat_exchange_not_stored")
+        return ChatOutcome.NOT_STORED
+
+    async def _store_once(
+        self, user_id: uuid.UUID, receipt_id: uuid.UUID, exchange: Exchange
+    ) -> None:
+        """Store the exchange in Postgres, then in short-term memory, each while holding the user.
+
+        Postgres commits first, so the mark that ends the work (`stored`) is
+        set only once the rows are in. A user deleted meanwhile gets nothing.
+        """
+        async with self._conversations.hold(user_id) as held:
+            if held is None:
+                return
+            reply = await self._memory.reply(user_id, receipt_id)
+            if reply is None or reply.state is ReplyState.STORED:
+                return
+            if reply.state is ReplyState.SENDING:
+                await self._memory.reply_delivered(user_id, receipt_id, exchange)
+            await held.record(receipt_id, exchange.messages, exchange.language)
+        async with self._conversations.hold(user_id) as held:
+            if held is not None:
+                await self._memory.remember(user_id, receipt_id, exchange)
+
+    async def _fail(self, prepared: _Prepared | None, error: Exception) -> ChatOutcome:
         """Send the bot's error message, if the message and its sender are known."""
         logger.error("chat_answer_failed", extra={"error": type(error).__name__})
-        if not isinstance(prepared, _Prepared):
+        if prepared is None:
             return ChatOutcome.FAILED
-        if not await self._memory.start_reply(prepared.user_id, prepared.receipt_id):
-            return ChatOutcome.ALREADY_SENT
-        wording = _error_wording(prepared.profile.language)
-        try:
-            await self._sender.send(
-                prepared.profile.recipient_id,
-                AnswerMessages(intro=wording.error, results=(), wording=None),
-                prepared.message.received_at,
-            )
-        except MessengerError as send_error:
-            logger.warning("chat_error_send_failed", extra={"error": type(send_error).__name__})
+        async with self._conversations.hold(prepared.user_id) as held:
+            if held is None:
+                return ChatOutcome.NO_USER
+            if not await self._memory.start_reply(prepared.user_id, prepared.receipt_id):
+                return ChatOutcome.ALREADY_SENT
+            wording = _error_wording(prepared.profile.language)
+            try:
+                await self._sender.send(
+                    prepared.profile.recipient_id,
+                    AnswerMessages(intro=wording.error, results=(), wording=None),
+                    prepared.received.message.received_at,
+                )
+            except MessengerError as send_error:
+                logger.warning("chat_error_send_failed", extra={"error": type(send_error).__name__})
         return ChatOutcome.FAILED
 
 
 def _turn(prepared: _Prepared) -> AgentTurn:
     working_set = prepared.session.working_set
+    message = prepared.received.message
     return AgentTurn(
         user_id=prepared.user_id,
         country=prepared.profile.country,
-        text=prepared.message.text,
+        text=message.text,
         history=tuple(
             Message(role=message.role, content=message.content)
             for message in prepared.session.history
         ),
         working_set=working_set.item_ids if working_set is not None else (),
-        deletion_confirmed=confirms_deletion(prepared.message.quick_reply_payload),
+        deletion_confirmed=confirms_deletion(message.quick_reply_payload),
         home_area=prepared.profile.home_area,
         working_set_shown=working_set.shown if working_set is not None else None,
         working_set_searches=working_set.searches if working_set is not None else (),
+        message_number=prepared.received.number,
     )
 
 

@@ -7,7 +7,10 @@ need Postgres (`TEST_DATABASE_ADMIN_URL`) and Redis (`TEST_REDIS_URL`). Every
 id and text is synthetic.
 """
 
+import itertools
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
@@ -16,6 +19,10 @@ import pytest
 from arq import Retry
 from arq.connections import ArqRedis
 from arq.jobs import Job
+from redis.exceptions import RedisError
+from sqlalchemy import event
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, async_sessionmaker
 
 from app.agent.chat import ChatOutcome, RetryLaterError
 from app.agent.replies.templates import (
@@ -33,11 +40,14 @@ from app.agent.tools import (
 from app.agent.worker import ChatWorkerResources, answer_chat_message, build_worker
 from app.config.base import Settings
 from app.config.chat import ChatSettings
+from app.db.deletion import UserDataEraser
 from app.ingestion.jobs import ANSWER_CHAT_MESSAGE_JOB, CHAT_QUEUE, chat_job_id
+from app.memory.session import Reply, ReplyState, Session
 from app.models.errors import ModelRequestError, ModelUnavailableError
 from tests.agent.agent_support import CONFIRM_SECONDS, MAX_STEPS, final_answer, tool_calls
 from tests.agent.chat_support import (
     ChatStores,
+    ChatUnderTest,
     build_chat,
     count_messages,
     seed_place,
@@ -153,8 +163,8 @@ async def test_a_yes_delete_tap_right_after_the_delivered_question_deletes(
     assert await stored_user(chat_stores, user_id) is None
 
 
-@pytest.mark.parametrize("when", ["typed-yes", "later-tap"])
-async def test_a_typed_yes_or_a_later_tap_deletes_nothing(
+@pytest.mark.parametrize("when", ["typed-yes", "later-tap", "expired-tap"])
+async def test_a_typed_yes_a_later_tap_or_an_expired_tap_deletes_nothing(
     chat_stores: ChatStores, when: str
 ) -> None:
     user_id = await chat_stores.new_user(SENDER_ID)
@@ -166,14 +176,17 @@ async def test_a_typed_yes_or_a_later_tap_deletes_nothing(
     chat = build_chat(chat_stores, script)
     asked = await chat_stores.send_text(user_id, "delete my data")
     await chat.responder.respond(user_id, asked, last_try=False)
-    if when == "later-tap":
-        other = await chat_stores.send_text(user_id, "hello")
-        await chat.responder.respond(user_id, other, last_try=False)
+    if when == "typed-yes":
+        last = await chat_stores.send_text(user_id, "yes")
+    else:
+        if when == "later-tap":
+            other = await chat_stores.send_text(user_id, "hello")
+            await chat.responder.respond(user_id, other, last_try=False)
+        else:
+            chat_stores.clock.advance(CONFIRM_SECONDS)
         last = await chat_stores.send_text(
             user_id, "Yes, delete", quick_reply_payload=DELETION_CONFIRM_PAYLOAD
         )
-    else:
-        last = await chat_stores.send_text(user_id, "yes")
 
     outcome = await chat.responder.respond(user_id, last, last_try=False)
 
@@ -204,6 +217,152 @@ async def test_another_users_tap_deletes_neither_of_them(chat_stores: ChatStores
     assert await stored_user(chat_stores, asking) is not None
     assert await stored_user(chat_stores, tapping) is not None
     assert chat.sent_bodies()[-1]["recipient"] == {"id": OTHER_SENDER_ID}
+
+
+async def ask_to_delete(chat_stores: ChatStores, chat: ChatUnderTest, user_id: uuid.UUID) -> None:
+    """The user asks to delete their data, and the question is delivered."""
+    asked = await chat_stores.send_text(user_id, "delete my data")
+    assert await chat.responder.respond(user_id, asked, last_try=False) is ChatOutcome.ANSWERED
+
+
+async def tap_yes_delete(chat_stores: ChatStores, user_id: uuid.UUID) -> uuid.UUID:
+    return await chat_stores.send_text(
+        user_id, "Yes, delete", quick_reply_payload=DELETION_CONFIRM_PAYLOAD
+    )
+
+
+async def test_a_tap_after_another_message_deletes_nothing_even_if_its_job_runs_first(
+    chat_stores: ChatStores,
+) -> None:
+    user_id = await chat_stores.new_user(SENDER_ID)
+    # The model calls confirm_data_deletion on every turn; only code decides.
+    chat = build_chat(
+        chat_stores,
+        [
+            REQUEST,
+            final_answer("en", "…"),
+            CONFIRM,
+            final_answer("en", "Nothing was deleted."),
+            final_answer("en", "Kept."),
+        ],
+    )
+    await ask_to_delete(chat_stores, chat, user_id)
+    declined = await chat_stores.send_text(user_id, "No, keep my data")
+    tapped = await tap_yes_delete(chat_stores, user_id)
+    # A repeated delivery of the earlier "no" changes nothing either.
+    assert await chat_stores.deliver_again(declined) == declined
+
+    # The tap's job runs before the job of the message the user sent before it.
+    assert await chat.responder.respond(user_id, tapped, last_try=False) is ChatOutcome.ANSWERED
+    assert await chat.responder.respond(user_id, declined, last_try=False) is ChatOutcome.ANSWERED
+
+    assert await stored_user(chat_stores, user_id) is not None
+    assert chat.sent_texts() == [QUESTION, "Nothing was deleted.", "Kept."]
+
+
+async def test_a_tap_after_a_shared_post_deletes_nothing(chat_stores: ChatStores) -> None:
+    user_id = await chat_stores.new_user(SENDER_ID)
+    chat = build_chat(
+        chat_stores,
+        [REQUEST, final_answer("en", "…"), CONFIRM, final_answer("en", "Nothing was deleted.")],
+    )
+    await ask_to_delete(chat_stores, chat, user_id)
+    await chat_stores.share(user_id)
+    tapped = await tap_yes_delete(chat_stores, user_id)
+
+    await chat.responder.respond(user_id, tapped, last_try=False)
+
+    assert await stored_user(chat_stores, user_id) is not None
+    assert chat.sent_texts()[-1] == "Nothing was deleted."
+
+
+async def test_a_tap_whose_job_is_retried_later_still_deletes(
+    chat_stores: ChatStores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user_id = await chat_stores.new_user(SENDER_ID)
+    chat = build_chat(chat_stores, [REQUEST, final_answer("en", "…"), CONFIRM])
+    await ask_to_delete(chat_stores, chat, user_id)
+    tapped = await tap_yes_delete(chat_stores, user_id)
+    load = chat_stores.memory.load
+    failures = [RedisError("synthetic outage")]
+
+    async def load_after_an_outage(user: uuid.UUID) -> Session:
+        if failures:
+            raise failures.pop()
+        return await load(user)
+
+    monkeypatch.setattr(chat_stores.memory, "load", load_after_an_outage)
+
+    with pytest.raises(RetryLaterError):
+        await chat.responder.respond(user_id, tapped, last_try=False)
+    outcome = await chat.responder.respond(user_id, tapped, last_try=False)
+
+    assert outcome is ChatOutcome.ANSWERED
+    assert await stored_user(chat_stores, user_id) is None
+    assert chat.sent_texts() == [QUESTION, DONE]
+
+
+async def test_a_message_retried_while_a_later_tap_runs_lets_the_tap_delete_nothing(
+    chat_stores: ChatStores,
+) -> None:
+    user_id = await chat_stores.new_user(SENDER_ID)
+    chat = build_chat(
+        chat_stores,
+        [
+            REQUEST,
+            final_answer("en", "…"),
+            MODEL_DOWN,
+            CONFIRM,
+            final_answer("en", "Nothing was deleted."),
+            final_answer("en", "Okay."),
+        ],
+    )
+    await ask_to_delete(chat_stores, chat, user_id)
+    other = await chat_stores.send_text(user_id, "wait, first show my cafés")
+    tapped = await tap_yes_delete(chat_stores, user_id)
+
+    with pytest.raises(RetryLaterError):
+        await chat.responder.respond(user_id, other, last_try=False)
+    await chat.responder.respond(user_id, tapped, last_try=False)
+    await chat.responder.respond(user_id, other, last_try=True)
+
+    assert await stored_user(chat_stores, user_id) is not None
+    assert chat.sent_texts() == [QUESTION, "Nothing was deleted.", "Okay."]
+
+
+async def test_a_repeated_delivery_of_an_earlier_message_does_not_stand_in_the_way(
+    chat_stores: ChatStores,
+) -> None:
+    user_id = await chat_stores.new_user(SENDER_ID)
+    chat = build_chat(chat_stores, [REQUEST, final_answer("en", "…"), CONFIRM])
+    asked = await chat_stores.send_text(user_id, "delete my data")
+    await chat.responder.respond(user_id, asked, last_try=False)
+    # Meta delivers the request again after the question was sent.
+    await chat_stores.deliver_again(asked)
+    tapped = await tap_yes_delete(chat_stores, user_id)
+
+    await chat.responder.respond(user_id, tapped, last_try=False)
+
+    assert await stored_user(chat_stores, user_id) is None
+    assert chat.sent_texts() == [QUESTION, DONE]
+
+
+async def test_a_tap_delivered_twice_is_one_job_that_deletes_once(
+    chat_stores: ChatStores, ingestion_redis: ArqRedis
+) -> None:
+    user_id = await chat_stores.new_user(SENDER_ID)
+    chat = build_chat(chat_stores, [REQUEST, final_answer("en", "…"), CONFIRM])
+    await ask_to_delete(chat_stores, chat, user_id)
+    tapped = await tap_yes_delete(chat_stores, user_id)
+
+    assert await chat_stores.deliver_again(tapped) == tapped
+    queued = await ingestion_redis.queued_jobs(queue_name=CHAT_QUEUE)
+    assert [job.job_id for job in queued].count(chat_job_id(tapped)) == 1
+    await chat.responder.respond(user_id, tapped, last_try=False)
+    assert await chat.responder.respond(user_id, tapped, last_try=False) is ChatOutcome.NO_MESSAGE
+
+    assert await stored_user(chat_stores, user_id) is None
+    assert chat.sent_texts() == [QUESTION, DONE]
 
 
 async def test_after_delete_my_data_the_session_working_set_messages_and_profile_are_gone(
@@ -334,9 +493,143 @@ async def test_a_failed_send_is_not_retried_or_remembered(chat_stores: ChatStore
     outcome = await chat.responder.respond(user_id, receipt, last_try=False)
 
     assert outcome is ChatOutcome.SEND_FAILED
-    assert await chat_stores.memory.reply_started(user_id, receipt)
+    assert await chat_stores.memory.reply(user_id, receipt) == Reply(ReplyState.SENDING)
     assert (await chat_stores.memory.load(user_id)).history == ()
     assert await count_messages(chat_stores, user_id) == 0
+
+
+@contextmanager
+def conversation_inserts_fail(
+    sessions: async_sessionmaker[AsyncSession], times: int | None
+) -> Iterator[None]:
+    """Make the database refuse `conversation_msg` rows, `times` times or until the block ends."""
+    bind = sessions.kw["bind"]
+    target = bind.sync_connection if isinstance(bind, AsyncConnection) else bind.sync_engine
+    failures = itertools.count() if times is None else iter(range(times))
+
+    def refuse(
+        conn: object, cursor: object, statement: str, *args: object, **kwargs: object
+    ) -> None:
+        if (
+            statement.startswith("INSERT INTO conversation_msg")
+            and next(failures, None) is not None
+        ):
+            raise OperationalError(statement, None, ConnectionError("synthetic outage"))
+
+    event.listen(target, "before_cursor_execute", refuse)
+    try:
+        yield
+    finally:
+        event.remove(target, "before_cursor_execute", refuse)
+
+
+async def assert_stored_once(
+    chat_stores: ChatStores, chat: ChatUnderTest, user_id: uuid.UUID, answer_text: str
+) -> None:
+    """One delivered answer, and the whole exchange in Postgres and in short-term memory."""
+    assert chat.sent_texts() == [answer_text]
+    exchange = [("user", "hi"), ("assistant", answer_text)]
+    assert await stored_messages(chat_stores, user_id) == exchange
+    session = await chat_stores.memory.load(user_id)
+    assert [(message.role, message.content) for message in session.history] == exchange
+    user = await stored_user(chat_stores, user_id)
+    assert user is not None
+    assert user.language == "en"
+
+
+async def test_a_database_failure_after_sending_is_stored_again_without_sending_again(
+    chat_stores: ChatStores,
+) -> None:
+    user_id = await chat_stores.new_user(SENDER_ID)
+    chat = build_chat(chat_stores, [final_answer("en", "Stored after all.")])
+    receipt = await chat_stores.send_text(user_id, "hi")
+
+    with conversation_inserts_fail(chat_stores.sessions, times=1):
+        outcome = await chat.responder.respond(user_id, receipt, last_try=False)
+
+    assert outcome is ChatOutcome.ANSWERED
+    await assert_stored_once(chat_stores, chat, user_id, "Stored after all.")
+
+
+async def test_a_redis_failure_after_sending_is_stored_again_without_sending_again(
+    chat_stores: ChatStores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user_id = await chat_stores.new_user(SENDER_ID)
+    chat = build_chat(chat_stores, [final_answer("en", "Stored after all.")])
+    receipt = await chat_stores.send_text(user_id, "hi")
+    remember = chat_stores.memory.remember
+    failures = [RedisError("synthetic outage")]
+
+    async def remember_after_an_outage(*args: object, **kwargs: object) -> None:
+        if failures:
+            raise failures.pop()
+        await remember(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(chat_stores.memory, "remember", remember_after_an_outage)
+
+    outcome = await chat.responder.respond(user_id, receipt, last_try=False)
+
+    assert outcome is ChatOutcome.ANSWERED
+    await assert_stored_once(chat_stores, chat, user_id, "Stored after all.")
+
+
+async def test_a_later_try_stores_a_delivered_answer_instead_of_stopping_as_already_sent(
+    chat_stores: ChatStores,
+) -> None:
+    user_id = await chat_stores.new_user(SENDER_ID)
+    chat = build_chat(chat_stores, [final_answer("en", "Stored on the next try.")])
+    receipt = await chat_stores.send_text(user_id, "hi")
+
+    with (
+        conversation_inserts_fail(chat_stores.sessions, times=None),
+        pytest.raises(RetryLaterError),
+    ):
+        await chat.responder.respond(user_id, receipt, last_try=False)
+    outcome = await chat.responder.respond(user_id, receipt, last_try=True)
+
+    assert outcome is ChatOutcome.ANSWERED
+    await assert_stored_once(chat_stores, chat, user_id, "Stored on the next try.")
+    assert chat.agent.generator.requests[1:] == []
+
+
+async def test_a_last_try_that_cannot_store_gives_up_without_an_error_message(
+    chat_stores: ChatStores,
+) -> None:
+    user_id = await chat_stores.new_user(SENDER_ID)
+    chat = build_chat(chat_stores, [final_answer("en", "Delivered.")])
+    receipt = await chat_stores.send_text(user_id, "hi")
+
+    with conversation_inserts_fail(chat_stores.sessions, times=None):
+        outcome = await chat.responder.respond(user_id, receipt, last_try=True)
+
+    assert outcome is ChatOutcome.NOT_STORED
+    assert chat.sent_texts() == ["Delivered."]
+    assert await count_messages(chat_stores, user_id) == 0
+
+
+async def test_an_answer_stored_late_is_not_brought_back_after_a_deletion(
+    chat_stores: ChatStores, redis_url: str
+) -> None:
+    user_id = await chat_stores.new_user(SENDER_ID)
+    chat = build_chat(chat_stores, [final_answer("en", "Delivered.")])
+    marker = f"synthetic-{uuid.uuid4().hex}"
+    receipt = await chat_stores.send_text(user_id, marker)
+
+    with (
+        conversation_inserts_fail(chat_stores.sessions, times=None),
+        pytest.raises(RetryLaterError),
+    ):
+        await chat.responder.respond(user_id, receipt, last_try=False)
+    eraser = UserDataEraser(chat_stores.sessions, chat_stores.outside_postgres())
+    assert await eraser.erase(user_id) == 0
+    outcome = await chat.responder.respond(user_id, receipt, last_try=True)
+
+    assert outcome is ChatOutcome.NO_MESSAGE
+    assert chat.sent_texts() == ["Delivered."]
+    assert await count_messages(chat_stores, user_id) == 0
+    stored = await all_stored_bytes(redis_url)
+    assert str(user_id).encode() not in stored
+    assert marker.encode() not in stored
 
 
 async def test_a_message_whose_payload_is_gone_is_not_answered(chat_stores: ChatStores) -> None:

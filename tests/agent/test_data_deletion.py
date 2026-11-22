@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.adapters.base import CaptureEvent, ChatMessage
 from app.agent.agent import AgentAnswer, AgentTurn, AgentWordingError
-from app.agent.deletion_requests import RedisDeletionRequests
+from app.agent.deletion_requests import PendingDeletion, RedisDeletionRequests
 from app.agent.replies.answers import AnswerSender, DeliveryReport
 from app.agent.replies.messenger import MessengerRequestError
 from app.agent.replies.templates import (
@@ -124,6 +124,12 @@ class SavedUser:
     sender_id: str
     item_id: uuid.UUID
     marker: str
+    # Each turn answers the user's next message, numbered as ingestion would.
+    messages_sent: int = 0
+
+    def next_message(self) -> int:
+        self.messages_sent += 1
+        return self.messages_sent
 
 
 @pytest.fixture
@@ -186,7 +192,13 @@ async def answer(
     agent: AgentUnderTest, user: SavedUser, text: str, *, confirmed: bool = False
 ) -> AgentAnswer:
     return await agent.agent.answer(
-        AgentTurn(user_id=user.user_id, country=None, text=text, deletion_confirmed=confirmed)
+        AgentTurn(
+            user_id=user.user_id,
+            country=None,
+            text=text,
+            deletion_confirmed=confirmed,
+            message_number=user.next_message(),
+        )
     )
 
 
@@ -203,6 +215,7 @@ async def deliver(
         user.sender_id,
         result,
         MESSENGER_NOW,
+        user.messages_sent,
     )
 
 
@@ -418,6 +431,7 @@ async def test_the_delivered_question_carries_the_delete_button(stores: Stores) 
             user.sender_id,
             result,
             MESSENGER_NOW,
+            user.messages_sent,
         )
 
         (body,) = under_test.api.bodies()
@@ -428,7 +442,7 @@ async def test_the_delivered_question_carries_the_delete_button(stores: Stores) 
                 "payload": DELETION_CONFIRM_PAYLOAD,
             }
         ]
-        assert await stores.requests.take(user.user_id) is not None
+        assert await stores.requests.take(user.user_id, user.messages_sent + 1) is not None
     finally:
         await clean_up(stores, user)
 
@@ -596,9 +610,28 @@ async def test_another_users_request_never_lets_this_user_delete(stores: Stores)
         assert await user_exists(stores, asking.user_id)
         assert await user_exists(stores, other.user_id)
         # The asking user's own request is still waiting for their own next message.
-        assert await stores.requests.take(asking.user_id) is not None
+        assert await stores.requests.take(asking.user_id, asking.messages_sent + 1) is not None
     finally:
         await clean_up(stores, asking, other)
+
+
+async def test_a_request_is_taken_only_by_the_message_it_waits_for(stores: Stores) -> None:
+    user_id = uuid.uuid4()
+    pending = PendingDeletion(
+        deadline=stores.clock.now + timedelta(seconds=CONFIRM_SECONDS),
+        awaited_message=5,
+        language="en",
+        done_text="done",
+    )
+    await stores.requests.save(user_id, pending, stores.clock.now)
+
+    try:
+        assert await stores.requests.take(user_id, 4) is None
+        assert await stores.requests.take(user_id, 6) is None
+        assert await stores.requests.take(user_id, 5) == pending
+        assert await stores.requests.take(user_id, 5) is None
+    finally:
+        await stores.requests.erase_user(user_id, ())
 
 
 async def test_a_failing_store_leaves_postgres_unchanged_and_a_repeat_succeeds(
