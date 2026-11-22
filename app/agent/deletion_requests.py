@@ -4,9 +4,9 @@ Deleting a user can't be undone, so it takes two steps (SAV-17, owner update of
 20 Nov 2026), and code, not the prompt, decides when the second may run:
 
 1. `request_data_deletion` only answers with the confirmation question. The
-   request is stored here **once that question was delivered**
-   (`app.agent.send.send_answer`), with its real deadline and the "done"
-   message already written in the user's language. A question that was never
+   request is planned right before the question is sent, with its deadline
+   and the "done" message already written in the user's language, and stored
+   here **once that question was delivered** (`app.agent.send`). A question that was never
    generated, translated or sent leaves nothing that can be confirmed.
 2. The request waits for one message: the user's next one after the question
    was sent. Ingestion numbers every message a user sends, in the order it
@@ -29,7 +29,7 @@ import uuid
 from collections.abc import Awaitable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Final, Protocol, cast
+from typing import Any, Final, Protocol, cast
 
 from redis.asyncio import Redis
 
@@ -110,15 +110,7 @@ class RedisDeletionRequests(DeletionRequests):
         if pending.deadline.tzinfo is None or now.tzinfo is None:
             raise ValueError("the deadline and now must carry a time zone")
         remaining_ms = int((pending.deadline - now).total_seconds() * _MILLISECONDS_PER_SECOND)
-        value = json.dumps(
-            {
-                _DEADLINE: pending.deadline.isoformat(),
-                _AWAITED_MESSAGE: pending.awaited_message,
-                _LANGUAGE: pending.language,
-                _DONE_TEXT: pending.done_text,
-            },
-            ensure_ascii=False,
-        )
+        value = json.dumps(pending_to_value(pending), ensure_ascii=False)
         await self._redis.set(_key(user_id), value, px=max(_MINIMUM_LIFETIME_MS, remaining_ms))
 
     async def take(self, user_id: uuid.UUID, message_number: int) -> PendingDeletion | None:
@@ -141,7 +133,7 @@ class RedisDeletionRequests(DeletionRequests):
             Awaitable[bytes | None],
             self._redis.eval(_TAKE_IF_AWAITED, 1, _key(user_id), str(message_number)),
         )
-        return None if stored is None else _pending_from_json(stored)
+        return None if stored is None else pending_from_value(json.loads(stored))
 
     async def erase_user(self, user_id: uuid.UUID, saved_item_ids: Sequence[uuid.UUID]) -> None:
         """Erase the user's pending request; part of "delete my data".
@@ -160,8 +152,32 @@ def _key(user_id: uuid.UUID) -> str:
     return f"{_KEY_PREFIX}:{user_id}:{_KEY_NAME}"
 
 
-def _pending_from_json(stored: bytes) -> PendingDeletion:
-    value = json.loads(stored)
+def pending_to_value(pending: PendingDeletion) -> dict[str, object]:
+    """Return a request as a JSON object.
+
+    Args:
+        pending: The request.
+
+    Returns:
+        Its deadline, awaited message, language and "done" wording.
+    """
+    return {
+        _DEADLINE: pending.deadline.isoformat(),
+        _AWAITED_MESSAGE: pending.awaited_message,
+        _LANGUAGE: pending.language,
+        _DONE_TEXT: pending.done_text,
+    }
+
+
+def pending_from_value(value: dict[str, Any]) -> PendingDeletion:
+    """Read a request back from `pending_to_value`'s JSON object.
+
+    Args:
+        value: The JSON object.
+
+    Returns:
+        The request.
+    """
     return PendingDeletion(
         deadline=datetime.fromisoformat(value[_DEADLINE]),
         awaited_message=value[_AWAITED_MESSAGE],

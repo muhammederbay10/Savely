@@ -147,7 +147,8 @@ class AgentAnswer:
         more_item_ids: Results beyond the cap, for "show more".
         availability_gaps: Streaming availability the resolver should fetch (SAV-15).
         deletion_confirmation: Set when `messages` is the deletion question;
-            pass it to `Toolbox.confirmation_delivered` once it was sent.
+            plan its request with `Toolbox.deletion_request` and keep it with
+            `Toolbox.keep_deletion_request` once the question was sent.
         deleted_recipients: Set when the user's data was deleted in this turn:
             where to send `messages`, read before the deletion, because the
             user's platform accounts are gone now.

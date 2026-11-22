@@ -23,8 +23,9 @@ one.
 never delete on its own word. `confirm_data_deletion` erases only when all of
 these hold, and refuses otherwise:
 
-- the confirmation question was delivered: `Toolbox.confirmation_delivered`
-  stores the request only after the whole answer was sent;
+- the confirmation question was delivered: the request is planned before
+  sending (`Toolbox.deletion_request`) and stored only after the whole answer
+  was sent (`Toolbox.keep_deletion_request`);
 - this turn answers the user's next message after the question: the request
   waits for that message's number, given by ingestion in the order messages
   arrive (`ToolContext.message_number`), and only its turn takes the request
@@ -417,30 +418,44 @@ class Toolbox:
         self._deletion_window = deletion_window
         self._now = now
 
-    async def confirmation_delivered(
-        self, user_id: uuid.UUID, confirmation: DeletionConfirmation, last_message_number: int
-    ) -> None:
-        """Make a delivered deletion question confirmable by the user's next message.
+    def deletion_request(
+        self, confirmation: DeletionConfirmation, last_message_number: int
+    ) -> PendingDeletion:
+        """Plan the request a deletion question makes confirmable once it is delivered.
 
-        Call it only after the whole answer was sent (`app.agent.send.send_answer`).
+        Call it right before sending the question. Its deadline counts from
+        now, so storing it later never gives the user more time, and it waits
+        for the message after `last_message_number` however late it is stored.
 
         Args:
-            user_id: The DM's sender the question was sent to.
             confirmation: The question's language and prepared "done" message.
             last_message_number: The number of the user's last message before
-                the question was sent; only the one after it can confirm.
+                the question is sent; only the one after it can confirm.
 
-        Raises:
-            redis.exceptions.RedisError: If Redis cannot be reached.
+        Returns:
+            The request, not stored yet.
         """
-        now = self._now()
-        pending = PendingDeletion(
-            deadline=now + self._deletion_window,
+        return PendingDeletion(
+            deadline=self._now() + self._deletion_window,
             awaited_message=last_message_number + 1,
             language=confirmation.language,
             done_text=confirmation.done_text,
         )
-        await self._deletion_requests.save(user_id, pending, now)
+
+    async def keep_deletion_request(self, user_id: uuid.UUID, request: PendingDeletion) -> None:
+        """Make a delivered deletion question confirmable by the user's next message.
+
+        Call it only after the whole answer was sent. Storing the same request
+        again changes nothing; one past its deadline can't be confirmed.
+
+        Args:
+            user_id: The DM's sender the question was sent to.
+            request: The request planned with `deletion_request`.
+
+        Raises:
+            redis.exceptions.RedisError: If Redis cannot be reached.
+        """
+        await self._deletion_requests.save(user_id, request, self._now())
         logger.info("data_deletion_confirmation_delivered")
 
     def for_user(self, context: ToolContext) -> "UserTools":
@@ -847,7 +862,7 @@ class UserTools:
 
     async def _request_data_deletion(self, arguments: NoArguments) -> ToolOutcome:
         # Nothing is stored yet: the request becomes confirmable only once the
-        # question was delivered (`Toolbox.confirmation_delivered`).
+        # question was delivered (`Toolbox.keep_deletion_request`).
         # The event only, never who asked (owner update of 20 Nov 2026).
         logger.info("data_deletion_requested")
         return ToolOutcome(

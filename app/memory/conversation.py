@@ -17,7 +17,10 @@ starts after the erasure finds no user and writes nothing. `FOR KEY SHARE`
 doesn't make ingestion wait, nor another answer of the same user.
 
 An exchange's rows get ids made from the message's receipt and their place in
-the exchange, so storing the same exchange again adds nothing.
+the exchange (`exchange_message_id`), so storing the same exchange again adds
+nothing. They are written only after the answer was sent, so they also prove
+that it was: a later try of the job that finds them (`exchange_messages_stored`)
+can store the rest of the exchange although Redis never recorded the delivery.
 """
 
 import uuid
@@ -25,7 +28,7 @@ from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -96,6 +99,31 @@ class ConversationStore:
             recipient_id=recipient_id, country=country, home_area=home_area, language=language
         )
 
+    async def exchange_messages_stored(
+        self, user_id: uuid.UUID, receipt_id: uuid.UUID, messages: int
+    ) -> int:
+        """Return how many messages of an answered message's exchange are in `conversation_msg`.
+
+        Args:
+            user_id: The DM's sender.
+            receipt_id: The receipt of the message the exchange answers.
+            messages: How many messages the exchange has.
+
+        Returns:
+            How many of them are stored; 0 if the answer was never recorded as sent.
+
+        Raises:
+            sqlalchemy.exc.SQLAlchemyError: If the database failed.
+        """
+        ids = [exchange_message_id(receipt_id, position) for position in range(messages)]
+        async with self._sessions() as session:
+            stored = await session.scalar(
+                select(func.count())
+                .select_from(ConversationMessage)
+                .where(ConversationMessage.user_id == user_id, ConversationMessage.id.in_(ids))
+            )
+        return stored or 0
+
     @asynccontextmanager
     async def hold(self, user_id: uuid.UUID) -> AsyncIterator["HeldUser | None"]:
         """Hold the user's row until the block ends, so "delete my data" waits for it.
@@ -136,7 +164,8 @@ class HeldUser:
     ) -> None:
         """Store an exchange in `conversation_msg`, and the language the user wrote in.
 
-        Storing the same exchange again adds no row.
+        Storing the same exchange again adds no row and leaves the language
+        alone, so a late repeat can't undo a newer message's language.
 
         Args:
             receipt_id: The receipt of the message the exchange answers.
@@ -147,24 +176,39 @@ class HeldUser:
         Raises:
             sqlalchemy.exc.SQLAlchemyError: If the database failed.
         """
-        if messages:
-            await self._session.execute(
-                insert(ConversationMessage)
-                .values(
-                    [
-                        {
-                            "id": uuid.uuid5(receipt_id, str(position)),
-                            "user_id": self._user_id,
-                            "role": message.role,
-                            "content": message.content,
-                            "at": message.at,
-                        }
-                        for position, message in enumerate(messages)
-                    ]
-                )
-                .on_conflict_do_nothing(index_elements=[ConversationMessage.id])
+        if not messages:
+            return
+        inserted = await self._session.execute(
+            insert(ConversationMessage)
+            .values(
+                [
+                    {
+                        "id": exchange_message_id(receipt_id, position),
+                        "user_id": self._user_id,
+                        "role": message.role,
+                        "content": message.content,
+                        "at": message.at,
+                    }
+                    for position, message in enumerate(messages)
+                ]
             )
-        if language is not None:
+            .on_conflict_do_nothing(index_elements=[ConversationMessage.id])
+            .returning(ConversationMessage.id)
+        )
+        if inserted.first() is not None and language is not None:
             await self._session.execute(
                 update(User).where(User.id == self._user_id).values(language=language)
             )
+
+
+def exchange_message_id(receipt_id: uuid.UUID, position: int) -> uuid.UUID:
+    """Return the `conversation_msg` id of one message of an answered message's exchange.
+
+    Args:
+        receipt_id: The receipt of the message the exchange answers.
+        position: The message's place in the exchange, from 0.
+
+    Returns:
+        The same id every time, so the row is stored once.
+    """
+    return uuid.uuid5(receipt_id, str(position))

@@ -49,7 +49,6 @@ def exchange(*numbers: int, results: WorkingSet | None = None) -> Exchange:
         messages=tuple(message(number) for number in numbers),
         working_set=results,
         language="en",
-        sent_whole=True,
     )
 
 
@@ -104,7 +103,7 @@ async def test_the_session_expires_after_its_lifetime(
 ) -> None:
     memory = SessionMemory(ingestion_redis, lifetime=SHORT_LIFETIME, max_messages=20)
     await remember(memory, user_id, [1, 2], working_set(uuid.uuid4()))
-    await memory.start_reply(user_id, uuid.uuid4())
+    await memory.start_reply(user_id, uuid.uuid4(), exchange(3))
 
     await asyncio.sleep(SHORT_LIFETIME.total_seconds() * 2)
 
@@ -135,11 +134,14 @@ async def test_only_the_first_try_may_start_a_reply(
     memory = SessionMemory(ingestion_redis, lifetime=DAY, max_messages=20)
     receipt_id, other_receipt_id = uuid.uuid4(), uuid.uuid4()
 
+    first, second = exchange(1, 2), exchange(3, 4)
+
     assert await memory.reply(user_id, receipt_id) is None
-    assert await memory.start_reply(user_id, receipt_id)
-    assert not await memory.start_reply(user_id, receipt_id)
-    assert await memory.reply(user_id, receipt_id) == Reply(ReplyState.SENDING)
-    assert await memory.reply(user_id, other_receipt_id) is None
+    assert await memory.start_reply(user_id, receipt_id, first)
+    assert not await memory.start_reply(user_id, receipt_id, second)
+    assert await memory.reply(user_id, receipt_id) == Reply(ReplyState.SENDING, first)
+    assert await memory.start_reply(user_id, other_receipt_id, None)
+    assert await memory.reply(user_id, other_receipt_id) == Reply(ReplyState.SENDING)
 
 
 async def test_a_reply_goes_from_sending_to_delivered_to_stored_with_its_exchange(
@@ -148,10 +150,13 @@ async def test_a_reply_goes_from_sending_to_delivered_to_stored_with_its_exchang
     memory = SessionMemory(ingestion_redis, lifetime=DAY, max_messages=20)
     receipt_id = uuid.uuid4()
     sent = exchange(1, 2, results=working_set(uuid.uuid4(), uuid.uuid4()))
-    await memory.start_reply(user_id, receipt_id)
+    await memory.start_reply(user_id, receipt_id, sent)
 
-    await memory.reply_delivered(user_id, receipt_id, sent)
-    assert await memory.reply(user_id, receipt_id) == Reply(ReplyState.DELIVERED, sent)
+    await memory.reply_delivered(user_id, receipt_id, sent_whole=True)
+    assert await memory.reply(user_id, receipt_id) == Reply(ReplyState.DELIVERED, sent, True)
+    # Only a reply that is still being sent moves on.
+    await memory.reply_delivered(user_id, receipt_id, sent_whole=False)
+    assert await memory.reply(user_id, receipt_id) == Reply(ReplyState.DELIVERED, sent, True)
     assert (await memory.load(user_id)).history == ()
 
     await memory.remember(user_id, receipt_id, sent)
@@ -161,6 +166,19 @@ async def test_a_reply_goes_from_sending_to_delivered_to_stored_with_its_exchang
     )
 
 
+async def test_a_delivery_of_an_erased_reply_writes_nothing(
+    ingestion_redis: ArqRedis, user_id: uuid.UUID
+) -> None:
+    memory = SessionMemory(ingestion_redis, lifetime=DAY, max_messages=20)
+    receipt_id = uuid.uuid4()
+    await memory.start_reply(user_id, receipt_id, exchange(1, 2))
+    await memory.erase_user(user_id, ())
+
+    await memory.reply_delivered(user_id, receipt_id, sent_whole=True)
+
+    assert await ingestion_redis.keys(f"*{user_id}*") == []
+
+
 async def test_erasing_a_user_removes_their_session_and_no_one_elses(
     ingestion_redis: ArqRedis, user_id: uuid.UUID
 ) -> None:
@@ -168,7 +186,7 @@ async def test_erasing_a_user_removes_their_session_and_no_one_elses(
     other_user_id = uuid.uuid4()
     for someone in (user_id, other_user_id):
         await remember(memory, someone, [1], working_set(uuid.uuid4()))
-        await memory.start_reply(someone, uuid.uuid4())
+        await memory.start_reply(someone, uuid.uuid4(), None)
 
     try:
         await memory.erase_user(user_id, ())

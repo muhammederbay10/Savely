@@ -18,13 +18,22 @@ exchange. The history is appended and trimmed in one transaction, so two
 answers that end at the same time both keep their messages; the working set is
 replaced whole, and the later answer wins.
 
-**A reply goes through three states** (`ReplyState`): `sending` right before
-the answer is sent, `delivered` once it was sent, with the exchange still to be
-stored, and `stored` once the exchange is in. `remember` appends the exchange
-and marks the reply stored in one transaction, so storing it again after a
-failure never doubles it. The chat worker writes here only while it holds the
-user's row (`app.memory.conversation.ConversationStore.hold`), so nothing is
-written for a user who was deleted.
+**A reply goes through three states** (`ReplyState`), kept in `replies` under
+the receipt's id:
+
+- `sending`, set right before the answer is sent, with the exchange the answer
+  will add once sent (`<receipt>:planned`). A try that finds it never sends
+  again, because some of the answer may have arrived.
+- `delivered`, once it was sent, with whether all of it was
+  (`<receipt>:sent_whole`); the exchange is still to be stored.
+- `stored`, once the exchange is in; the planned exchange is dropped.
+
+`remember` appends the exchange and marks the reply stored in one
+transaction, so storing it again after a failure never doubles it. The chat
+worker writes here only while it holds the user's row
+(`app.memory.conversation.ConversationStore.hold`), so nothing is written for
+a user who was deleted; `reply_delivered` instead changes only a reply that is
+still `sending`, in one step, so it never brings an erased reply back.
 
 "Delete my data" erases the three keys (`erase_user`, one of
 `UserDataEraser`'s stores).
@@ -40,6 +49,7 @@ from typing import Any, Final, Literal, cast
 
 from redis.asyncio import Redis
 
+from app.agent.deletion_requests import PendingDeletion, pending_from_value, pending_to_value
 from app.agent.tools import SearchUsed
 
 _KEY_PREFIX: Final = "savely:memory"
@@ -47,8 +57,11 @@ _HISTORY: Final = "history"
 _WORKING_SET: Final = "working_set"
 _REPLIES: Final = "replies"
 _ALL_KEY_NAMES: Final = (_HISTORY, _WORKING_SET, _REPLIES)
-_STATE: Final = "state"
-_EXCHANGE: Final = "exchange"
+_PLANNED_SUFFIX: Final = ":planned"
+_SENT_WHOLE_SUFFIX: Final = ":sent_whole"
+_TRUE: Final = "1"
+_FALSE: Final = "0"
+_MILLISECONDS_PER_SECOND: Final = 1000
 
 SessionRole = Literal["user", "assistant"]
 
@@ -87,22 +100,30 @@ class WorkingSet:
 
 @dataclass(frozen=True)
 class Exchange:
-    """What answering one message adds to the conversation.
+    """What answering one message adds to the conversation, once it is sent.
 
     Attributes:
-        messages: The user's text and, when the whole answer was sent, the
-            bot's reply, oldest first.
+        messages: The user's text, then the bot's reply, oldest first.
         working_set: The answer's results; `None` keeps the last ones.
         language: The BCP 47 tag of the language the user wrote in; `None`
             leaves the stored one.
-        sent_whole: Whether the whole answer was sent; the closed reply
-            window can cut it off.
+        deletion_request: When the answer is a deletion question, the request
+            it makes confirmable, planned before sending
+            (`app.agent.send.deletion_request`).
     """
 
     messages: tuple[SessionMessage, ...]
     working_set: WorkingSet | None
     language: str | None
-    sent_whole: bool
+    deletion_request: PendingDeletion | None = field(default=None, repr=False)
+
+    def cut_off(self) -> "Exchange":
+        """Return what is kept when the closed reply window cut the answer off: the user's text.
+
+        Returns:
+            The exchange without the bot's reply, its results or its question.
+        """
+        return Exchange(messages=self.messages[:1], working_set=None, language=self.language)
 
 
 class ReplyState(StrEnum):
@@ -113,17 +134,40 @@ class ReplyState(StrEnum):
     STORED = "stored"
 
 
+# Sets the `sending` mark and keeps the planned exchange with it, only for the first try.
+_START_REPLY: Final = f"""
+if redis.call("HSETNX", KEYS[1], ARGV[1], "{ReplyState.SENDING.value}") == 0 then
+    return 0
+end
+if ARGV[3] ~= "" then
+    redis.call("HSET", KEYS[1], ARGV[2], ARGV[3])
+end
+redis.call("PEXPIRE", KEYS[1], ARGV[4])
+return 1
+"""
+# Moves a reply that is still `sending` to `delivered`; anything else stays as it is.
+_MARK_DELIVERED: Final = f"""
+if redis.call("HGET", KEYS[1], ARGV[1]) == "{ReplyState.SENDING.value}" then
+    redis.call("HSET", KEYS[1], ARGV[1], "{ReplyState.DELIVERED.value}", ARGV[2], ARGV[3])
+end
+return 0
+"""
+
+
 @dataclass(frozen=True)
 class Reply:
     """The answer to one message, as far as it got.
 
     Attributes:
         state: Being sent (it may have arrived), sent, or sent and stored.
-        exchange: While `DELIVERED`, the exchange that is still to be stored.
+        planned: Until it is stored, the exchange it adds once sent; `None`
+            for the bot's error message, which adds nothing.
+        sent_whole: Once delivered, whether all of it was sent; `None` before.
     """
 
     state: ReplyState
-    exchange: Exchange | None = None
+    planned: Exchange | None = None
+    sent_whole: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -212,14 +256,18 @@ class SessionMemory:
                 pipeline.set(
                     _key(user_id, _WORKING_SET), _working_set_to_json(exchange.working_set)
                 )
-            pipeline.hset(
-                _key(user_id, _REPLIES), str(receipt_id), _reply_to_json(Reply(ReplyState.STORED))
+            replies_key, field_name = _key(user_id, _REPLIES), str(receipt_id)
+            pipeline.hset(replies_key, field_name, ReplyState.STORED.value)
+            pipeline.hdel(
+                replies_key, field_name + _PLANNED_SUFFIX, field_name + _SENT_WHOLE_SUFFIX
             )
             for name in _ALL_KEY_NAMES:
                 pipeline.pexpire(_key(user_id, name), self._lifetime)
             await pipeline.execute()
 
-    async def start_reply(self, user_id: uuid.UUID, receipt_id: uuid.UUID) -> bool:
+    async def start_reply(
+        self, user_id: uuid.UUID, receipt_id: uuid.UUID, planned: Exchange | None
+    ) -> bool:
         """Mark that the answer to a message starts to be sent; only the first call wins.
 
         A chat job calls it right before sending. If a worker stopped after
@@ -229,6 +277,8 @@ class SessionMemory:
         Args:
             user_id: The user.
             receipt_id: The receipt of the message being answered.
+            planned: The exchange the answer adds once sent, kept with the mark
+                so a later try can store it; `None` for the error message.
 
         Returns:
             Whether this call set the mark; `False` if an earlier try did.
@@ -236,38 +286,50 @@ class SessionMemory:
         Raises:
             redis.exceptions.RedisError: If Redis cannot be reached.
         """
-        replies_key = _key(user_id, _REPLIES)
-        async with self._redis.pipeline(transaction=True) as pipeline:
-            pipeline.hsetnx(replies_key, str(receipt_id), _reply_to_json(Reply(ReplyState.SENDING)))
-            pipeline.pexpire(replies_key, self._lifetime)
-            newly_set, _ = await pipeline.execute()
-        return bool(newly_set)
+        field_name = str(receipt_id)
+        planned_json = "" if planned is None else _exchange_to_json(planned)
+        started = await cast(
+            Awaitable[int],
+            self._redis.eval(
+                _START_REPLY,
+                1,
+                _key(user_id, _REPLIES),
+                field_name,
+                field_name + _PLANNED_SUFFIX,
+                planned_json,
+                str(_milliseconds(self._lifetime)),
+            ),
+        )
+        return bool(started)
 
     async def reply_delivered(
-        self, user_id: uuid.UUID, receipt_id: uuid.UUID, exchange: Exchange
+        self, user_id: uuid.UUID, receipt_id: uuid.UUID, *, sent_whole: bool
     ) -> None:
-        """Record that the answer to a message was sent, with the exchange still to store.
+        """Record that the answer to a message was sent, if its reply is still `sending`.
 
-        A later try of the job finds it (`reply`) and stores the exchange
-        without sending anything.
+        A reply that is gone (erased with its user, or expired) or further on
+        is left as it is, in the same step, so this needs no hold on the user.
 
         Args:
             user_id: The user.
             receipt_id: The receipt of the message.
-            exchange: What the answer adds to the conversation.
+            sent_whole: Whether all of the answer was sent.
 
         Raises:
             redis.exceptions.RedisError: If Redis cannot be reached.
         """
-        replies_key = _key(user_id, _REPLIES)
-        async with self._redis.pipeline(transaction=True) as pipeline:
-            pipeline.hset(
-                replies_key,
-                str(receipt_id),
-                _reply_to_json(Reply(ReplyState.DELIVERED, exchange)),
-            )
-            pipeline.pexpire(replies_key, self._lifetime)
-            await pipeline.execute()
+        field_name = str(receipt_id)
+        await cast(
+            Awaitable[int],
+            self._redis.eval(
+                _MARK_DELIVERED,
+                1,
+                _key(user_id, _REPLIES),
+                field_name,
+                field_name + _SENT_WHOLE_SUFFIX,
+                _TRUE if sent_whole else _FALSE,
+            ),
+        )
 
     async def reply(self, user_id: uuid.UUID, receipt_id: uuid.UUID) -> Reply | None:
         """Return how far the answer to a message got.
@@ -282,10 +344,21 @@ class SessionMemory:
         Raises:
             redis.exceptions.RedisError: If Redis cannot be reached.
         """
-        stored = await cast(
-            Awaitable[bytes | None], self._redis.hget(_key(user_id, _REPLIES), str(receipt_id))
+        field_name = str(receipt_id)
+        state, planned, sent_whole = await cast(
+            Awaitable[list[bytes | None]],
+            self._redis.hmget(
+                _key(user_id, _REPLIES),
+                [field_name, field_name + _PLANNED_SUFFIX, field_name + _SENT_WHOLE_SUFFIX],
+            ),
         )
-        return None if stored is None else _reply_from_json(stored)
+        if state is None:
+            return None
+        return Reply(
+            state=ReplyState(state.decode()),
+            planned=None if planned is None else _exchange_from_json(planned),
+            sent_whole=None if sent_whole is None else sent_whole.decode() == _TRUE,
+        )
 
     async def erase_user(self, user_id: uuid.UUID, saved_item_ids: Sequence[uuid.UUID]) -> None:
         """Erase the user's short-term memory; part of "delete my data".
@@ -340,42 +413,38 @@ def _working_set_to_value(working_set: WorkingSet) -> dict[str, object]:
     }
 
 
-def _reply_to_json(reply: Reply) -> str:
-    exchange = reply.exchange
+def _exchange_to_json(exchange: Exchange) -> str:
     return json.dumps(
         {
-            _STATE: reply.state.value,
-            _EXCHANGE: None
-            if exchange is None
-            else {
-                "messages": [_message_to_value(message) for message in exchange.messages],
-                "working_set": None
-                if exchange.working_set is None
-                else _working_set_to_value(exchange.working_set),
-                "language": exchange.language,
-                "sent_whole": exchange.sent_whole,
-            },
+            "messages": [_message_to_value(message) for message in exchange.messages],
+            "working_set": None
+            if exchange.working_set is None
+            else _working_set_to_value(exchange.working_set),
+            "language": exchange.language,
+            "deletion_request": None
+            if exchange.deletion_request is None
+            else pending_to_value(exchange.deletion_request),
         },
         ensure_ascii=False,
     )
 
 
-def _reply_from_json(stored: bytes) -> Reply:
+def _exchange_from_json(stored: bytes) -> Exchange:
     value = json.loads(stored)
-    exchange = value[_EXCHANGE]
-    return Reply(
-        state=ReplyState(value[_STATE]),
-        exchange=None
-        if exchange is None
-        else Exchange(
-            messages=tuple(_message_from_value(message) for message in exchange["messages"]),
-            working_set=None
-            if exchange["working_set"] is None
-            else _working_set_from_value(exchange["working_set"]),
-            language=exchange["language"],
-            sent_whole=exchange["sent_whole"],
-        ),
+    return Exchange(
+        messages=tuple(_message_from_value(message) for message in value["messages"]),
+        working_set=None
+        if value["working_set"] is None
+        else _working_set_from_value(value["working_set"]),
+        language=value["language"],
+        deletion_request=None
+        if value["deletion_request"] is None
+        else pending_from_value(value["deletion_request"]),
     )
+
+
+def _milliseconds(duration: timedelta) -> int:
+    return int(duration.total_seconds() * _MILLISECONDS_PER_SECOND)
 
 
 def _working_set_from_value(value: dict[str, Any]) -> WorkingSet:

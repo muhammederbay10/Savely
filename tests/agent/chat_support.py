@@ -112,24 +112,24 @@ class ChatStores:
         """Meta delivers a text it already delivered once. Returns the receipt id ingestion uses."""
         return await self._ingest(self.delivered[receipt_id])
 
-    async def share(self, user_id: uuid.UUID) -> None:
-        """The user shares a reel with the bot, as a message of its own."""
+    async def share(self, user_id: uuid.UUID, *, post_id: str | None = None) -> CaptureEvent:
+        """The user shares a reel with the bot, as a message of its own. Returns the capture."""
         marker = uuid.uuid4().hex
-        await self.ingestion.ingest_capture(
-            CaptureEvent(
-                user_id=user_id,
-                platform=INSTAGRAM,
-                source="dm",
-                post_url=None,
-                platform_post_id=None,
-                caption=None,
-                media_url=f"https://lookaside.example.test/ig_messaging_cdn/?asset_id={marker}",
-                media_type="reel",
-                collection_hint=None,
-                source_message_id=f"mid-synthetic-share-{marker}",
-                received_at=self._next_send_time(),
-            )
+        event = CaptureEvent(
+            user_id=user_id,
+            platform=INSTAGRAM,
+            source="dm",
+            post_url=None,
+            platform_post_id=post_id,
+            caption=None,
+            media_url=f"https://lookaside.example.test/ig_messaging_cdn/?asset_id={marker}",
+            media_type="reel",
+            collection_hint=None,
+            source_message_id=f"mid-synthetic-share-{marker}",
+            received_at=self._next_send_time(),
         )
+        await self.ingestion.ingest_capture(event)
+        return event
 
     def _next_send_time(self) -> datetime:
         # A minute apart: longer than the collection-hint window, so a text is chat.

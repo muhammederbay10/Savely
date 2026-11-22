@@ -131,7 +131,7 @@ class IngestionService:
             await _require_user(session, event.user_id)
             # A share is a message too: one in between makes a later "Yes, delete"
             # tap no longer the next message after the deletion question.
-            await self._state.number_message(event.user_id)
+            await self._state.number_message(event.user_id, event.platform, event.source_message_id)
             stored = await store_capture(session, event)
             await self._state.record_share(
                 event.user_id, event.platform, stored.saved_item_id, event.received_at
@@ -193,7 +193,9 @@ class IngestionService:
         hinted_item_id = await self._item_awaiting_hint(session, message)
         receipt = TextReceipt(
             id=uuid.uuid4(),
-            number=await self._state.number_message(message.user_id),
+            number=await self._state.number_message(
+                message.user_id, message.platform, message.message_id
+            ),
             route=TextRoute.CHAT if hinted_item_id is None else TextRoute.COLLECTION_HINT,
             saved_item_id=hinted_item_id,
             chat_queued=False,

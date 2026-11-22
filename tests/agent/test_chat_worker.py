@@ -42,7 +42,7 @@ from app.config.base import Settings
 from app.config.chat import ChatSettings
 from app.db.deletion import UserDataEraser
 from app.ingestion.jobs import ANSWER_CHAT_MESSAGE_JOB, CHAT_QUEUE, chat_job_id
-from app.memory.session import Reply, ReplyState, Session
+from app.memory.session import ReplyState, Session
 from app.models.errors import ModelRequestError, ModelUnavailableError
 from tests.agent.agent_support import CONFIRM_SECONDS, MAX_STEPS, final_answer, tool_calls
 from tests.agent.chat_support import (
@@ -59,6 +59,7 @@ from tests.redis_inspection import all_stored_bytes
 
 SENDER_ID = "1000000000000191"
 OTHER_SENDER_ID = "1000000000000192"
+REPEATED_POST_ID = "18000000000000291"
 CONFIRM_MINUTES = CONFIRM_SECONDS // 60
 RETRY_DELAY_SECONDS = 3.0
 MAX_TRIES = 3
@@ -276,6 +277,113 @@ async def test_a_tap_after_a_shared_post_deletes_nothing(chat_stores: ChatStores
     assert chat.sent_texts()[-1] == "Nothing was deleted."
 
 
+async def test_a_repeated_delivery_of_an_earlier_share_does_not_stand_in_the_way(
+    chat_stores: ChatStores,
+) -> None:
+    user_id = await chat_stores.new_user(SENDER_ID)
+    chat = build_chat(chat_stores, [REQUEST, final_answer("en", "…"), CONFIRM])
+    shared = await chat_stores.share(user_id)
+    await ask_to_delete(chat_stores, chat, user_id)
+    # Meta delivers the share sent before the question again.
+    await chat_stores.ingestion.ingest_capture(shared)
+    tapped = await tap_yes_delete(chat_stores, user_id)
+
+    await chat.responder.respond(user_id, tapped, last_try=False)
+
+    assert await stored_user(chat_stores, user_id) is None
+    assert chat.sent_texts() == [QUESTION, DONE]
+
+
+async def test_a_new_share_of_an_already_shared_post_still_stands_in_the_way(
+    chat_stores: ChatStores,
+) -> None:
+    user_id = await chat_stores.new_user(SENDER_ID)
+    chat = build_chat(
+        chat_stores,
+        [REQUEST, final_answer("en", "…"), CONFIRM, final_answer("en", "Nothing was deleted.")],
+    )
+    await chat_stores.share(user_id, post_id=REPEATED_POST_ID)
+    await ask_to_delete(chat_stores, chat, user_id)
+    await chat_stores.share(user_id, post_id=REPEATED_POST_ID)
+    tapped = await tap_yes_delete(chat_stores, user_id)
+
+    await chat.responder.respond(user_id, tapped, last_try=False)
+
+    assert await stored_user(chat_stores, user_id) is not None
+    assert chat.sent_texts()[-1] == "Nothing was deleted."
+
+
+def failing(
+    monkeypatch: pytest.MonkeyPatch, target: object, name: str, times: int | None
+) -> list[bool]:
+    """Make a Redis write fail, `times` times or until the returned switch is emptied."""
+    original = getattr(target, name)
+    switch = [True]
+    failures = itertools.count() if times is None else iter(range(times))
+
+    async def fail_then_work(*args: object, **kwargs: object) -> object:
+        if switch and next(failures, None) is not None:
+            raise RedisError("synthetic outage")
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(target, name, fail_then_work)
+    return switch
+
+
+async def test_a_question_whose_request_failed_to_save_once_still_becomes_confirmable(
+    chat_stores: ChatStores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user_id = await chat_stores.new_user(SENDER_ID)
+    chat = build_chat(chat_stores, [REQUEST, final_answer("en", "…"), CONFIRM])
+    failing(monkeypatch, chat_stores.requests, "save", times=1)
+
+    await ask_to_delete(chat_stores, chat, user_id)
+    assert await stored_messages(chat_stores, user_id) == [
+        ("user", "delete my data"),
+        ("assistant", QUESTION),
+    ]
+    tapped = await tap_yes_delete(chat_stores, user_id)
+    await chat.responder.respond(user_id, tapped, last_try=False)
+
+    assert await stored_user(chat_stores, user_id) is None
+    assert chat.sent_texts() == [QUESTION, DONE]
+
+
+@pytest.mark.parametrize("meanwhile", ["nothing", "another-message", "expiry"])
+async def test_a_question_whose_request_is_saved_by_a_later_try_keeps_its_message_and_deadline(
+    chat_stores: ChatStores, monkeypatch: pytest.MonkeyPatch, meanwhile: str
+) -> None:
+    user_id = await chat_stores.new_user(SENDER_ID)
+    script = [REQUEST, final_answer("en", "…")]
+    if meanwhile == "another-message":
+        script.append(final_answer("en", "Hello."))
+    script.extend([CONFIRM, final_answer("en", "Nothing was deleted.")])
+    chat = build_chat(chat_stores, script)
+    outage = failing(monkeypatch, chat_stores.requests, "save", times=None)
+    asked = await chat_stores.send_text(user_id, "delete my data")
+
+    with pytest.raises(RetryLaterError):
+        await chat.responder.respond(user_id, asked, last_try=False)
+    if meanwhile == "another-message":
+        hello = await chat_stores.send_text(user_id, "hello")
+        await chat.responder.respond(user_id, hello, last_try=False)
+    elif meanwhile == "expiry":
+        chat_stores.clock.advance(CONFIRM_SECONDS)
+    outage.clear()
+    assert await chat.responder.respond(user_id, asked, last_try=False) is ChatOutcome.ANSWERED
+    assert ("assistant", QUESTION) in await stored_messages(chat_stores, user_id)
+    tapped = await tap_yes_delete(chat_stores, user_id)
+    await chat.responder.respond(user_id, tapped, last_try=False)
+
+    assert chat.sent_texts().count(QUESTION) == 1
+    if meanwhile == "nothing":
+        assert await stored_user(chat_stores, user_id) is None
+        assert chat.sent_texts()[-1] == DONE
+    else:
+        assert await stored_user(chat_stores, user_id) is not None
+        assert chat.sent_texts()[-1] == "Nothing was deleted."
+
+
 async def test_a_tap_whose_job_is_retried_later_still_deletes(
     chat_stores: ChatStores, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -475,7 +583,7 @@ async def test_an_answer_whose_sending_started_is_never_sent_again(
     chat = build_chat(chat_stores, [final_answer("en", "Once.")])
     receipt = await chat_stores.send_text(user_id, "hi")
     # An earlier try started sending, then its worker stopped.
-    await chat_stores.memory.start_reply(user_id, receipt)
+    await chat_stores.memory.start_reply(user_id, receipt, None)
 
     outcome = await chat.responder.respond(user_id, receipt, last_try=False)
 
@@ -493,7 +601,9 @@ async def test_a_failed_send_is_not_retried_or_remembered(chat_stores: ChatStore
     outcome = await chat.responder.respond(user_id, receipt, last_try=False)
 
     assert outcome is ChatOutcome.SEND_FAILED
-    assert await chat_stores.memory.reply(user_id, receipt) == Reply(ReplyState.SENDING)
+    reply = await chat_stores.memory.reply(user_id, receipt)
+    assert reply is not None
+    assert reply.state is ReplyState.SENDING
     assert (await chat_stores.memory.load(user_id)).history == ()
     assert await count_messages(chat_stores, user_id) == 0
 
@@ -590,6 +700,51 @@ async def test_a_later_try_stores_a_delivered_answer_instead_of_stopping_as_alre
     assert outcome is ChatOutcome.ANSWERED
     await assert_stored_once(chat_stores, chat, user_id, "Stored on the next try.")
     assert chat.agent.generator.requests[1:] == []
+
+
+async def test_a_redis_outage_right_after_sending_is_stored_by_the_next_try(
+    chat_stores: ChatStores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user_id = await chat_stores.new_user(SENDER_ID)
+    chat = build_chat(chat_stores, [final_answer("en", "Stored on the next try.")])
+    receipt = await chat_stores.send_text(user_id, "hi")
+    # Postgres works throughout; Redis fails from the moment the answer was sent.
+    outage = failing(monkeypatch, chat_stores.memory, "reply_delivered", times=None)
+    remember_outage = failing(monkeypatch, chat_stores.memory, "remember", times=None)
+
+    with pytest.raises(RetryLaterError):
+        await chat.responder.respond(user_id, receipt, last_try=False)
+    outage.clear()
+    remember_outage.clear()
+    outcome = await chat.responder.respond(user_id, receipt, last_try=False)
+
+    assert outcome is ChatOutcome.ANSWERED
+    await assert_stored_once(chat_stores, chat, user_id, "Stored on the next try.")
+    assert len(chat.agent.generator.requests) == 1
+
+
+async def test_an_answer_recorded_only_in_postgres_is_not_brought_back_after_a_deletion(
+    chat_stores: ChatStores, monkeypatch: pytest.MonkeyPatch, redis_url: str
+) -> None:
+    user_id = await chat_stores.new_user(SENDER_ID)
+    chat = build_chat(chat_stores, [final_answer("en", "Delivered.")])
+    marker = f"synthetic-{uuid.uuid4().hex}"
+    receipt = await chat_stores.send_text(user_id, marker)
+    outage = failing(monkeypatch, chat_stores.memory, "reply_delivered", times=None)
+
+    with pytest.raises(RetryLaterError):
+        await chat.responder.respond(user_id, receipt, last_try=False)
+    assert await count_messages(chat_stores, user_id) == 2
+    eraser = UserDataEraser(chat_stores.sessions, chat_stores.outside_postgres())
+    assert await eraser.erase(user_id) == 0
+    outage.clear()
+    outcome = await chat.responder.respond(user_id, receipt, last_try=True)
+
+    assert outcome is ChatOutcome.NO_MESSAGE
+    assert await count_messages(chat_stores, user_id) == 0
+    stored = await all_stored_bytes(redis_url)
+    assert str(user_id).encode() not in stored
+    assert marker.encode() not in stored
 
 
 async def test_a_last_try_that_cannot_store_gives_up_without_an_error_message(
