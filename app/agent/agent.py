@@ -27,8 +27,15 @@ The items are capped at `AGENT_MAX_RESULTS_PER_ANSWER`; the rest are kept for
 
 **Working set.** "Mark the second one as watched" needs the results the user
 saw last. The caller passes them in `AgentTurn.working_set`, in the order they
-were numbered, and stores `AgentAnswer.working_set` for the next turn. Keeping
-it between messages is short-term memory (SAV-18).
+were numbered, with how many were shown and the searches they came from, and
+stores `AgentAnswer.working_set` and `AgentAnswer.searches` for the next turn.
+The model sees the list by number and the searches with their arguments, so
+"show more" lists the next ones and "only the cheap ones" repeats the search
+with one more filter. Keeping it between messages is short-term memory
+(`app/memory/session.py`, SAV-18).
+
+**Profile.** The user's home area, when known, is shown to the model, so
+"near home" needs no question; `set_profile` keeps it when the user tells it.
 """
 
 import json
@@ -56,6 +63,7 @@ from app.agent.tools import (
     DeletionConfirmation,
     Notice,
     PlatformRecipient,
+    SearchUsed,
     Toolbox,
     ToolContext,
     UserTools,
@@ -107,6 +115,13 @@ class AgentTurn:
             "Yes, delete" button: the chat worker (SAV-18) sets it only when
             `confirms_deletion(message.quick_reply_payload)` holds (record 0015,
             Q9). Without it no deletion runs, whatever the model does.
+        home_area: Where the user lives, from their profile; `None` if not known.
+        working_set_shown: How many of `working_set` were sent to the user;
+            `None` means all of them.
+        working_set_searches: The searches `working_set` came from.
+        message_number: The message's number among the sender's messages, from
+            ingestion. A deletion question can be confirmed only by the turn of
+            the message right after it; `None` confirms none.
     """
 
     user_id: uuid.UUID
@@ -115,6 +130,10 @@ class AgentTurn:
     history: Sequence[Message] = ()
     working_set: Sequence[uuid.UUID] = ()
     deletion_confirmed: bool = False
+    home_area: str | None = field(default=None, repr=False)
+    working_set_shown: int | None = None
+    working_set_searches: Sequence[SearchUsed] = ()
+    message_number: int | None = None
 
 
 @dataclass(frozen=True)
@@ -128,10 +147,15 @@ class AgentAnswer:
         more_item_ids: Results beyond the cap, for "show more".
         availability_gaps: Streaming availability the resolver should fetch (SAV-15).
         deletion_confirmation: Set when `messages` is the deletion question;
-            pass it to `Toolbox.confirmation_delivered` once it was sent.
+            plan its request with `Toolbox.deletion_request` and keep it with
+            `Toolbox.keep_deletion_request` once the question was sent.
         deleted_recipients: Set when the user's data was deleted in this turn:
             where to send `messages`, read before the deletion, because the
             user's platform accounts are gone now.
+        searches: The searches the results came from, for the next turn:
+            this turn's searches, or the last results' searches when the
+            answer lists items without a new search (e.g. "show more").
+            Empty when the answer lists no items.
     """
 
     language: str
@@ -141,6 +165,7 @@ class AgentAnswer:
     availability_gaps: tuple[AvailabilityGap, ...]
     deletion_confirmation: DeletionConfirmation | None = None
     deleted_recipients: tuple[PlatformRecipient, ...] = ()
+    searches: tuple[SearchUsed, ...] = ()
 
     @property
     def working_set(self) -> tuple[uuid.UUID, ...]:
@@ -201,6 +226,8 @@ class _Turn:
 
     tools: UserTools
     allowed_item_ids: set[uuid.UUID]
+    previous_searches: tuple[SearchUsed, ...]
+    searches: list[SearchUsed] = field(default_factory=list)
     notices: set[Notice] = field(default_factory=set)
     availability_gaps: dict[tuple[uuid.UUID, str], AvailabilityGap] = field(default_factory=dict)
     asks_deletion_confirmation: bool = False
@@ -251,10 +278,15 @@ class ResponseAgent:
                 user_id=turn.user_id,
                 country=turn.country,
                 deletion_confirmed=turn.deletion_confirmed,
+                message_number=turn.message_number,
             )
         )
         await tools.begin_turn()
-        state = _Turn(tools=tools, allowed_item_ids=set(turn.working_set))
+        state = _Turn(
+            tools=tools,
+            allowed_item_ids=set(turn.working_set),
+            previous_searches=tuple(turn.working_set_searches),
+        )
         messages = self._opening_messages(turn)
         max_steps = self._settings.agent_max_steps
         for step in range(1, max_steps + 1):
@@ -290,15 +322,40 @@ class ResponseAgent:
             max_results=self._settings.agent_max_results_per_answer
         )
         messages = [Message(role="system", content=system)]
-        if turn.working_set:
-            numbered = "\n".join(
-                f"{number}. {item_id}" for number, item_id in enumerate(turn.working_set, start=1)
-            )
+        if turn.home_area is not None:
             messages.append(
-                Message(role="system", content=self._prompts.working_set.format(items=numbered))
+                Message(
+                    role="system", content=self._prompts.profile.format(home_area=turn.home_area)
+                )
             )
+        if turn.working_set:
+            messages.extend(self._working_set_messages(turn))
         messages.extend(turn.history)
         messages.append(Message(role="user", content=turn.text))
+        return messages
+
+    def _working_set_messages(self, turn: AgentTurn) -> list[Message]:
+        numbered = "\n".join(
+            f"{number}. {item_id}" for number, item_id in enumerate(turn.working_set, start=1)
+        )
+        shown = len(turn.working_set) if turn.working_set_shown is None else turn.working_set_shown
+        messages = [
+            Message(
+                role="system",
+                content=self._prompts.working_set.format(items=numbered, shown=shown),
+            )
+        ]
+        if turn.working_set_searches:
+            searches = "\n".join(
+                f"{search.tool} {json.dumps(search.arguments, ensure_ascii=False)}"
+                for search in turn.working_set_searches
+            )
+            messages.append(
+                Message(
+                    role="system",
+                    content=self._prompts.working_set_searches.format(searches=searches),
+                )
+            )
         return messages
 
     async def _run_tools(
@@ -315,6 +372,8 @@ class ResponseAgent:
             for gap in outcome.availability_gaps:
                 state.availability_gaps[(gap.entity_id, gap.country)] = gap
             state.asks_deletion_confirmation |= outcome.asks_deletion_confirmation
+            if outcome.search is not None:
+                state.searches.append(outcome.search)
             messages.append(
                 Message(role="tool", content=outcome.as_json(), tool_call_id=tool_call.id)
             )
@@ -343,12 +402,14 @@ class ResponseAgent:
         cap = self._settings.agent_max_results_per_answer
         shown: tuple[ResultCard, ...] = cards[:cap]
         wording = await self._wording(final.language) if shown else None
+        searches = (tuple(state.searches) or state.previous_searches) if cards else ()
         return AgentAnswer(
             language=final.language,
             messages=AnswerMessages(intro=final.intro(), results=shown, wording=wording),
             notices=frozenset(state.notices),
             more_item_ids=tuple(card.item_id for card in cards[cap:]),
             availability_gaps=tuple(state.availability_gaps.values()),
+            searches=searches,
         )
 
     async def _deletion_question(self, language: str) -> AgentAnswer:

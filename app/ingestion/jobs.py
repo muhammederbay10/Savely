@@ -19,7 +19,7 @@ erases. A worker that finds no payload stops: the user was deleted.
 **Each job name has its own queue** (`INDEXING_QUEUE`, `CHAT_QUEUE`). A worker
 reads only the queue of the jobs it runs, so the indexing worker never takes a
 chat job it has no function for: that job would fail for good and be lost.
-Chat jobs wait in their queue until the response agent's worker (SAV-17) runs.
+Chat jobs are run by the chat worker (`app/agent/worker.py`).
 
 Every job has an id made from what it works on. arq refuses a second job with
 an id it still knows, which is how a webhook that Meta delivers twice ends up

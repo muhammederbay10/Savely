@@ -4,10 +4,11 @@ The confirmation says the item's open category ("Saved as car review"), also
 for an item with no built-in type, so the user can correct it
 (`docs/ARCHITECTURE.md` §3.3 and §3.4). Names found by a resolver come with SAV-15.
 
-It is written in the language of the user's profile. Until a language is
-known (SAV-17 and SAV-18 set it), or when that language has no wording yet, it
-is written in English, the owner's choice on SAV-14 (18 Nov 2026); the
-language is never guessed from the post. The output records which happened.
+It is written in the language of the user's profile, which the chat worker
+sets to the language the user last wrote in. Until a language is known, or
+when that language has no wording yet, it is written in English, the owner's
+choice on SAV-14 (18 Nov 2026); the language is never guessed from the post.
+The output records which happened.
 A failed send is recorded and not tried again, because a message whose
 delivery is unknown would be sent twice.
 """

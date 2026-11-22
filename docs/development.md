@@ -36,12 +36,13 @@ The values in `.env.example` work as they are for local development. To receive 
 make up
 ```
 
-This builds and starts four services and waits until all of them are running (and healthy, for the three that have a health check):
+This builds and starts five services and waits until all of them are running (and healthy, for the three that have a health check):
 
 | Service | What it is | Address on your machine |
 |---|---|---|
 | `api` | The FastAPI app | http://localhost:8000 |
 | `worker` | The indexing worker (see [Indexing pipeline](#indexing-pipeline)) | none |
+| `chat_worker` | The chat worker: answers DMs (see [Chat worker](#chat-worker)) | none |
 | `db` | Postgres 16 with PostGIS and pgvector | `localhost:5432` |
 | `redis` | Redis 7 | `localhost:6379` |
 
@@ -63,6 +64,7 @@ Useful commands:
 ```bash
 docker compose logs --follow api   # API logs, one JSON object per line
 docker compose logs --follow worker # indexing logs
+docker compose logs --follow chat_worker # chat logs
 make down                          # stop everything, keep the database data
 docker compose down --volumes      # stop everything and delete the local database
 ```
@@ -153,9 +155,10 @@ What happens to a message ([`app/adapters/instagram.py`](../app/adapters/instagr
 - **First contact:** the first message from an Instagram account creates its `user` and `platform_account` rows.
 - **Message id:** every saved item keeps the id of the message it came in with (`source_message_id`), so answers can reply to it (decision record 0004).
 - **One item per post and per message:** sharing the same post twice, or a webhook that Meta delivers twice, creates one saved item. Two reels saved into the collection have no post id, so they stay two items (decision record 0007).
-- **Jobs:** new items are queued as `index_saved_item` and texts as `answer_chat_message` on Redis, through `arq` ([`app/ingestion/jobs.py`](../app/ingestion/jobs.py)). A job holds only ids; the caption, text and media link it works on are in a per-user payload hash ([`app/ingestion/session_state.py`](../app/ingestion/session_state.py)). Each job name has its own arq queue (`arq:queue:indexing`, `arq:queue:chat`), so a worker only takes the jobs it can run. The indexing worker runs `index_saved_item` (see [Indexing pipeline](#indexing-pipeline)). The chat worker comes with the response agent (SAV-17); until then chat jobs wait in their queue and expire after a day.
+- **Jobs:** new items are queued as `index_saved_item` and texts as `answer_chat_message` on Redis, through `arq` ([`app/ingestion/jobs.py`](../app/ingestion/jobs.py)). A job holds only ids; the caption, text and media link it works on are in a per-user payload hash ([`app/ingestion/session_state.py`](../app/ingestion/session_state.py)). Each job name has its own arq queue (`arq:queue:indexing`, `arq:queue:chat`), so a worker only takes the jobs it can run. The indexing worker runs `index_saved_item` (see [Indexing pipeline](#indexing-pipeline)). The chat worker runs `answer_chat_message` (see [Chat worker](#chat-worker)).
 - **Routing is decided once:** each text's route is kept as a receipt by its message id before anything changes, so a repeated delivery is routed the same way, also when a delayed share arrived in between.
-- **Ingestion state:** payloads, text receipts and each user's recent shares stay in Redis for `INGESTION_STATE_TTL_SECONDS`, and "delete my data" erases them.
+- **Ingestion state:** payloads, text receipts, each user's recent shares and their message count stay in Redis for `INGESTION_STATE_TTL_SECONDS`, and "delete my data" erases them.
+- **Message numbers:** every new share or text gets the user's next number, in the order ingestion takes them in, once per platform message id: a repeated delivery of the same message keeps its first number, while a new message sharing an already shared post gets a new one. A share without a message id can't be told from its repeats, so each of its deliveries counts. A "delete my data" question can be confirmed only by the message numbered right after the last one before it was sent (see [Chat worker](#chat-worker)).
 - **Errors:** if Postgres or Redis is down, the endpoint answers 500 and Meta delivers the webhook again. Handling a webhook twice is safe.
 
 ### Connect the Meta app
@@ -583,19 +586,21 @@ A live run makes at most one decision call and one embedding call per case, plus
 
 The response agent answers a user's DM about their saves ([`ARCHITECTURE.md`](ARCHITECTURE.md) §3.5, decision record [0015](decisions/0015-response-agent.md)). It never queries the database: the text model (DeepSeek V4.1 Flash) calls the tools in [`app/agent/tools.py`](../app/agent/tools.py), and the tools search and write.
 
+In production the chat worker builds and runs it (see [Chat worker](#chat-worker)); the core of one turn is:
+
 ```python
-eraser = UserDataEraser(sessions, [IngestionDataEraser(state, job_queue), deletion_requests,
-                                  media_store])
-toolbox = Toolbox(sessions=sessions, retriever=retriever, corrections=corrections,
-                  registry=CONTENT_TYPES, deletion_requests=deletion_requests, eraser=eraser,
-                  deletion_window=timedelta(seconds=settings.data_deletion_confirm_seconds))
+toolbox = build_toolbox(sessions, redis, classifier=models.classifier, embedder=models.embedder,
+                        settings=settings, pipeline_settings=pipeline_settings,
+                        chat_settings=chat_settings)  # app/agent/worker.py
 agent = ResponseAgent(generator=models.text_generator, toolbox=toolbox,
                       prompts=AGENT_PROMPTS, settings=get_agent_settings())
 answer = await agent.answer(AgentTurn(user_id=sender_id, country=user.country,
-                                      text="horror movies on Netflix", working_set=last_ids))
-recipient = answer.deleted_recipients[0].platform_user_id if answer.deleted_recipients else igsid
-await send_answer(AnswerSender(messenger), toolbox, sender_id, recipient, answer,
-                  last_user_message_at)
+                                      text="only the cheap ones", history=history,
+                                      working_set=last_ids, working_set_shown=5,
+                                      working_set_searches=last_searches,
+                                      home_area=user.home_area, message_number=number))
+await send_answer(AnswerSender(messenger), toolbox, sender_id, igsid, answer,
+                  last_user_message_at, last_message_number)
 ```
 
 | Tool | What it does |
@@ -605,6 +610,7 @@ await send_answer(AnswerSender(messenger), toolbox, sender_id, recipient, answer
 | `get_item` | One item's details: open values with their paths, entities, links, streaming in the user's country |
 | `update_item` | Correct one open value of one item. Only that item changes; no synonym is created |
 | `set_status` | Mark the place or title behind an item as done (visited, watched, read) or wanted; an item without one (e.g. a study post) keeps the status on itself (`saved_item.user_status`) |
+| `set_profile` | Keeps where the user lives (`user.home_area`) and their country (`user.country`), when they tell it |
 | `request_data_deletion` | "Delete my data" in any words or language: the bot asks a fixed confirmation question |
 | `confirm_data_deletion` | Deletes everything of the sender, only on an explicit confirmation of a delivered question, in time |
 
@@ -612,10 +618,10 @@ await send_answer(AnswerSender(messenger), toolbox, sender_id, recipient, answer
 - **The answer is checked** before it is sent: it may only list items the tools returned or the user's last results, it must carry a notice when a search fell back (`backup_mode`, `broader_results`, `may_be_incomplete`), and it must fit in one DM. A wrong answer goes back to the model, within `AGENT_MAX_STEPS`; the last call may not call tools.
 - **Any language.** The model replies in the language of the user's message and names it. For a language without built-in reply wording, the agent asks the model once for the bot's fixed words in it; unusable wording is an error, never another language.
 - **Sending** (`app/agent/replies/answers.py`): an intro, then one reply per result that quotes the saved reel, at most `AGENT_MAX_RESULTS_PER_ANSWER`. A refused quote falls back to the post link (a preview card), then to the name with its Maps or TMDB link (decision record 0004). Meta answers an accepted reply the same way whether or not Instagram shows the quoted reel, so only a refused reply falls back (record 0015, Q7).
-- **"Delete my data" takes two steps, enforced in code; the model can never delete on its own word.** `request_data_deletion` makes the answer a fixed question in the user's language, with one **"Yes, delete" button** (a quick reply with the fixed payload `DELETION_CONFIRM_PAYLOAD`): what is deleted (saves, stored media, the conversation, the profile), that it can't be undone, and to tap the button. The fixed "done" message is prepared in the same language at the same time. `send_answer` (`app/agent/send.py`) stores the request in Redis (`app/agent/deletion_requests.py`) only after the whole answer was sent, with its deadline, `DATA_DELETION_CONFIRM_SECONDS` later. The request is taken out at the start of the user's next turn, so "no" or any other message cancels it. The Instagram adapter keeps a tapped button's payload as `ChatMessage.quick_reply_payload`; the chat worker (SAV-18) sets `AgentTurn.deletion_confirmed` only when `confirms_deletion(payload)` holds. `confirm_data_deletion` erases only with that confirmation and before the deadline, checked right before erasing and again by the eraser once it holds the user's row lock, which it may have to wait for; a typed "yes" shows the question and its button again and deletes nothing. It then runs `UserDataEraser` (`app/db/deletion.py`): ingestion's Redis state and jobs, the pending request and the stored media first, then the Postgres rows. A failure outside Postgres leaves Postgres unchanged, and a repeat succeeds. A successful erasure ends the turn at once with the prepared "done" message, sent to `AgentAnswer.deleted_recipients` (read before the deletion); no model or tool runs after it. Until SAV-18's worker sets the flag, DM deletion fails closed. The log lines `data_deletion_requested`, `data_deletion_confirmation_delivered` and `user_data_deleted` hold only the event and the number of items, and the agent's own lines (`agent_tool_called`, `agent_answered`) hold no user id; `tests/agent/test_data_deletion.py` checks that no id or message text is logged during a deletion.
+- **"Delete my data" takes two steps, enforced in code; the model can never delete on its own word.** `request_data_deletion` makes the answer a fixed question in the user's language, with one **"Yes, delete" button** (a quick reply with the fixed payload `DELETION_CONFIRM_PAYLOAD`): what is deleted (saves, stored media, the conversation, the profile), that it can't be undone, and to tap the button. The fixed "done" message is prepared in the same language at the same time. The request is planned right before sending, with its deadline `DATA_DELETION_CONFIRM_SECONDS` later (`app/agent/send.py`), and stored in Redis (`app/agent/deletion_requests.py`) only after the whole answer was sent; the chat worker stores it with the answer's exchange, trying again after a failure (see [Chat worker](#chat-worker)). The request waits for the user's next message after the question was sent, by its number from ingestion (see [Chat worker](#chat-worker)); only that message's turn takes it out, so "no", a share or any other message in between cancels it, whatever order the jobs run in. The Instagram adapter keeps a tapped button's payload as `ChatMessage.quick_reply_payload`; the chat worker (`app/agent/chat.py`) sets `AgentTurn.deletion_confirmed` only when `confirms_deletion(payload)` holds. `confirm_data_deletion` erases only with that confirmation and before the deadline, checked right before erasing and again by the eraser once it holds the user's row lock, which it may have to wait for; a typed "yes" shows the question and its button again and deletes nothing. It then runs `UserDataEraser` (`app/db/deletion.py`): ingestion's Redis state and jobs, the pending request, short-term memory and the stored media first, then the Postgres rows (the profile and `conversation_msg` go with the `user` row). A failure outside Postgres leaves Postgres unchanged, and a repeat succeeds. A successful erasure ends the turn at once with the prepared "done" message, sent to `AgentAnswer.deleted_recipients` (read before the deletion); no model or tool runs after it. The log lines `data_deletion_requested`, `data_deletion_confirmation_delivered` and `user_data_deleted` hold only the event and the number of items, and the agent's own lines (`agent_tool_called`, `agent_answered`) hold no user id; `tests/agent/test_data_deletion.py` checks that no id or message text is logged during a deletion.
 - **Corrections** (`app/pipeline/vocabulary/corrections.py`) go through the vocabulary's normal steps, keep the user's wording marked as set by hand, and count against the alias that produced the wrong value (`correction_count`, and `corrected_alias_ids` on the corrected path's normalize-step provenance). A corrected candidate alias is never verified. A verified alias that `VOCAB_ALIAS_REVIEW_MIN_USERS` different users corrected is logged as `vocabulary_alias_flagged_for_review`; one user's repeated corrections count once (record 0015, Q4).
 
-The wording sent to the text model is `AGENT_PROMPTS` in [`app/agent/prompts.py`](../app/agent/prompts.py), version `2026-11-20.3`, approved by the owner for now (record 0015, Q3). The tests use a fake model, so they check the loop and the tools, not the model's quality; the wording is scored on the evaluation set when SAV-19/20 exist.
+The wording sent to the text model is `AGENT_PROMPTS` in [`app/agent/prompts.py`](../app/agent/prompts.py), version `2026-11-21.1`: the owner approved `2026-11-20.3` for now (record 0015, Q3), and SAV-18 added the profile, the follow-up rules and the working set's searches (record 0016). The tests use a fake model, so they check the loop and the tools, not the model's quality; the wording is scored on the evaluation set when SAV-19/20 exist.
 
 | Variable | Meaning |
 |---|---|
@@ -623,9 +629,63 @@ The wording sent to the text model is `AGENT_PROMPTS` in [`app/agent/prompts.py`
 | `AGENT_MAX_RESULTS_PER_ANSWER` | The most saved items one answer sends back; the rest are kept for "show more" |
 | `AGENT_MAX_OUTPUT_TOKENS` | The longest reply the text model may write per call |
 | `VOCAB_ALIAS_REVIEW_MIN_USERS` | Different users whose corrections flag a verified vocabulary alias for review; at least 2 |
-| `DATA_DELETION_CONFIRM_SECONDS` | How long a delivered "delete my data" question may be confirmed |
+| `DATA_DELETION_CONFIRM_SECONDS` | How long a delivered "delete my data" question may be confirmed, counted from when sending it began |
 
 They are read through `AgentSettings` in [`app/config/agent.py`](../app/config/agent.py), with `get_agent_settings()`, with the same rules as the other settings classes.
+
+## Chat worker
+
+The chat worker answers the texts users write to the bot (decision records [0015](decisions/0015-response-agent.md) Q5 and [0016](decisions/0016-short-term-memory-and-chat-worker.md)). It runs `answer_chat_message` jobs from the chat queue (`arq:queue:chat`), separate from indexing:
+
+```bash
+python -m app.agent.worker
+```
+
+Under Compose, the `chat_worker` service runs the same command. Like the indexing worker it reads `.env` whole, and it shares the media volume, because "delete my data" from a DM also erases stored media. It reads `Settings`, `ModelSettings`, `PipelineSettings`, `RetrievalSettings`, `AgentSettings`, `MessengerSettings` and `ChatSettings`.
+
+For each text ([`app/agent/chat.py`](../app/agent/chat.py)):
+
+1. Read the message and its number from ingestion's state; none means the user was deleted, and the job stops.
+2. Load the sender's profile (their IGSID, country and home area) and short-term memory (the last messages and the working set).
+3. Run the response agent for that user only, with the user taken from the DM's sender. `deletion_confirmed` is set only when the message is a tap on the "Yes, delete" button, and the message's number must be the one the delivered question waits for: the sender's next message after it was sent. A "no", a share or any other message in between uses the question up, also when the tap's job runs first.
+4. Send the answer within Instagram's 24-hour window, counted from when the user sent the text.
+5. Store the exchange and the new working set in Redis, the messages in `conversation_msg`, and the language the user wrote in as `user.language` (the save confirmations use it).
+
+**One answer at a time per sender.** Steps 4 and 5 run while the job holds the sender's Postgres advisory lock (`ConversationStore.one_answer_at_a_time`), on a connection of its own that also runs the send and store transactions. The sender's next answer, or the bot's error message, waits until this one was sent and stored, so the working set is always the list the user saw last. The agent runs still overlap, and other users, ingestion and "delete my data" never wait for this lock.
+
+**Retention.** `conversation_msg` keeps every exchange until "delete my data" (Phase 1, record 0016); the Redis session expires after `SESSION_TTL_SECONDS`.
+
+**Answers never outlive "delete my data".** Steps 4 and 5 run while the job holds the user's row with `FOR KEY SHARE` ([`ConversationStore.hold`](../app/memory/conversation.py)), which the erasure's `FOR UPDATE` waits for, and only if the user still exists. An answer whose user was deleted first is neither sent nor stored; an erasure that starts while an answer is being sent or stored waits, then erases what was stored. Ingestion and other answers of the same user don't wait for this hold. Only the "done" message after a deletion is sent without it.
+
+**Short-term memory** ([`app/memory/session.py`](../app/memory/session.py)) keeps three keys per user, `savely:memory:<user id>:history|working_set|replies`, for `SESSION_TTL_SECONDS` after the last exchange. The history is the last `SESSION_HISTORY_MESSAGES` messages. The working set is the last answer's results in their numbered order, how many were shown, and the searches (tool and arguments) they came from: the model sees them by number for "the second one", knows which were not shown for "show more", and repeats the search with one more filter for "only the cheap ones". An answer that lists no items keeps the last working set. `replies` records per message how far its answer got: `sending` (it may have arrived, so it is never sent again), kept with the exchange the answer adds once sent; `delivered` (sent, and whether all of it was), and `stored`.
+
+**The profile** is the `user` row: `set_profile` keeps `home_area` and `country` when the user tells them ("I live in Beşiktaş"), and the model asks once when a question needs one it doesn't know. The home area is shown to the model on every turn.
+
+**Retries.** Preparing an answer has `CHAT_RUN_DEADLINE_SECONDS`. A failure there that may pass (a model outage, the deadline, Redis or Postgres) runs the job again after `CHAT_RETRY_DELAY_SECONDS` × the try's number, up to `CHAT_MAX_TRIES`; the last try sends the bot's error message in the user's language instead. A failure that would repeat (a rejected request, the step limit) sends the error message at once. A send that fails is logged (`chat_answer_send_failed`) and not tried again. A "Yes, delete" tap whose turn fails deletes nothing, because the request was used up: the user asks again.
+
+**Storing after sending.** Right before sending, the `sending` mark keeps the exchange the answer adds: the messages, the working set, the language, and a deletion question's request, already planned with the message it waits for and its deadline (counted from before sending, so storing it late never gives more time or lets a later message confirm). Once the answer was sent, storing it is tried up to `CHAT_MAX_TRIES` times, `CHAT_RETRY_DELAY_SECONDS` × the attempt apart (`chat_exchange_store_failed`):
+
+1. Postgres: the `conversation_msg` rows, with ids made from the message's receipt, and `user.language` when they are new. The rows are written only after sending, so they also prove the answer was sent.
+2. Redis: the reply moves from `sending` to `delivered`, in one step that changes nothing if the reply was erased.
+3. Redis, holding the user: the deletion request becomes confirmable, and the history and working set are stored in the script that marks the reply `stored`.
+
+**A late store never undoes newer state.** Each answer gets a delivery order when its sending starts. When an older answer is stored after newer ones, its messages are merged into the history by time (keeping the last `SESSION_HISTORY_MESSAGES`, with no duplicates), and its working set is kept only if no answer sent later set one. Its deletion request is stored only if no newer request is there and it wasn't already used up: taking a request leaves a used-up mark until its deadline. So a late retry can't make an old question confirmable again, replace a newer question, or change the list "the second one" refers to.
+
+Every step can be repeated without doubling anything. If a store stays down, the job runs again later and only stores, without running the agent or sending: it finds a `delivered` mark, or a `sending` mark next to the exchange's rows in Postgres. A `sending` mark without rows means it can't tell whether the answer arrived, so it stores nothing; that happens only when both stores failed after sending. The last try gives up (`chat_exchange_not_stored`).
+
+**"Delete my data"** goes through the one `UserDataEraser` that `build_toolbox` builds with every store outside Postgres: ingestion's Redis state and jobs, the pending deletion request, short-term memory and the media store. The profile fields and `conversation_msg` rows are deleted with the `user` row.
+
+| Variable | Meaning |
+|---|---|
+| `SESSION_TTL_SECONDS` | How long short-term memory lives after the last exchange (about 24 hours) |
+| `SESSION_HISTORY_MESSAGES` | How many of the last messages the response agent reads (about 20) |
+| `CHAT_CONCURRENCY` | Messages one chat worker answers at once |
+| `CHAT_MAX_TRIES` | Runs of one message's job before the error message is sent; also the attempts to store a sent answer in one run |
+| `CHAT_RETRY_DELAY_SECONDS` | The wait before a failed job runs again, times the try's number; also between attempts to store |
+| `CHAT_RUN_DEADLINE_SECONDS` | How long one try may take to prepare an answer; sending is not cut off |
+| `CHAT_JOB_TIMEOUT_SECONDS` | arq's own limit on one try; longer than the run deadline, only a backstop |
+
+They are read through `ChatSettings` in [`app/config/chat.py`](../app/config/chat.py), with `get_chat_settings()`. The log lines (`chat_answer_retry`, `chat_answer_failed`, `chat_answer_send_failed`, `chat_exchange_store_failed`, `chat_exchange_not_stored`, `user_profile_updated`) hold error class names and field names only, never a message, a place or an id.
 
 ## Project layout
 
@@ -633,7 +693,7 @@ They are read through `AgentSettings` in [`app/config/agent.py`](../app/config/a
 app/
   main.py             # FastAPI app factory and GET /health
   config/             # settings from environment variables, one module per group:
-                      # base (the API's Settings), models, messenger, pipeline, retrieval, agent
+                      # base (the API's Settings), models, messenger, pipeline, retrieval, agent, chat
   logging_config.py   # JSON logging setup
   adapters/
     base.py           # CaptureEvent and ChatMessage: what every adapter outputs
@@ -657,7 +717,9 @@ app/
     clients/          # one client per model role
   agent/
     agent.py          # the response agent's tool-calling loop and answer checks
-    tools.py          # search_items, near, get_item, update_item, set_status, deletion tools
+    tools.py          # search_items, near, get_item, update_item, set_status, set_profile, deletion tools
+    chat.py           # answers one chat message: memory in, agent, send, memory out
+    worker.py         # the chat worker (arq) and the eraser of every store
     send.py           # sends an answer; a delivered deletion question becomes confirmable
     prompts.py        # versioned wording for the text model
     deletion_requests.py # pending "delete my data" requests, with their deadline
@@ -673,6 +735,9 @@ app/
       messenger.py    # Instagram Send API client: DMs, quick replies, replies to saved reels
       templates.py    # fixed DM wording in the user's language
       answers.py      # an answer: the intro, then one reply per result, with fallbacks
+  memory/
+    session.py        # short-term memory in Redis: history, working set, reply marks
+    conversation.py   # the sender's profile and `conversation_msg` in Postgres
   db/
     models.py         # SQLAlchemy models
     session.py        # the API's engine and session factory
@@ -683,8 +748,8 @@ alembic.ini           # Alembic configuration
 scripts/spikes/       # reproducible experiments behind decision records (see its README)
 tests/                # pytest suite, in folders that mirror app/
 docker/postgres/      # Postgres 16 image with PostGIS and pgvector
-docker-compose.yml    # local stack: db, redis, api, worker
-Dockerfile            # the image of the API and the worker
+docker-compose.yml    # local stack: db, redis, api, worker, chat_worker
+Dockerfile            # the image of the API and the workers
 Makefile              # install, fmt, lint, typecheck, test, check, run, migrate, up, down
 README.md             # product front page for visitors
 assets/               # the logo

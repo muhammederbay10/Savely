@@ -10,12 +10,13 @@ Ingestion locks the same row while it handles a message, so no message of the
 user is half-stored while the user is deleted.
 
 What the user left outside Postgres (ingestion's job payloads and receipts in
-Redis, a pending deletion request, stored media files) is erased through
-`UserDataOutsidePostgres`, while the lock is held.
+Redis, a pending deletion request, short-term memory, stored media files) is
+erased through `UserDataOutsidePostgres`, while the lock is held.
 
 `UserDataEraser` is the one place that erases a user everywhere: every store
-outside Postgres, in order, then the rows. Any store that keeps user data
-later (short-term memory, SAV-18) joins it.
+outside Postgres, in order, then the rows. The chat worker builds it with
+every such store (`app.agent.worker.build_toolbox`); a new store of user data
+joins that list.
 """
 
 import logging

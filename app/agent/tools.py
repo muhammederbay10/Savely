@@ -10,6 +10,7 @@ searching and the writing:
 | `get_item` | One item's details: what it is, where, links, streaming in the user's country |
 | `update_item` | Correct one open value of one item; it never creates a synonym |
 | `set_status` | Mark an item's place or title, or an item without one, as done or wanted |
+| `set_profile` | Keep where the user lives (home area) and their country, as they told it |
 | `request_data_deletion` | Start "delete my data": the bot asks the user to confirm |
 | `confirm_data_deletion` | Delete everything of the sender, only on an explicit confirmation |
 
@@ -22,20 +23,28 @@ one.
 never delete on its own word. `confirm_data_deletion` erases only when all of
 these hold, and refuses otherwise:
 
-- the confirmation question was delivered: `Toolbox.confirmation_delivered`
-  stores the request only after the whole answer was sent;
-- this turn is the user's next message: `begin_turn` takes the request out, so
-  "no" or any other message uses it up, and a request of the same turn never counts;
+- the confirmation question was delivered: the request is planned before
+  sending (`Toolbox.deletion_request`) and stored only after the whole answer
+  was sent (`Toolbox.keep_deletion_request`);
+- this turn answers the user's next message after the question: the request
+  waits for that message's number, given by ingestion in the order messages
+  arrive (`ToolContext.message_number`), and only its turn takes the request
+  out (`begin_turn`). "No", a share or any other message in between uses it
+  up, whatever order the jobs run in, and a request of the same turn never counts;
 - the caller reports an explicit confirmation with this message
   (`ToolContext.deletion_confirmed`): a tap on the question's "Yes, delete"
   button, whose fixed payload the chat worker (SAV-18) checks with
   `confirms_deletion`. A typed "yes" never counts; the question is asked again;
-- the deadline (`DATA_DELETION_CONFIRM_SECONDS` after delivery) has not passed,
+- the deadline (`DATA_DELETION_CONFIRM_SECONDS` after sending the question began) has not passed,
   checked right before erasing.
 
 A successful erasure ends the turn (`ToolOutcome.completion`): the "done"
 message was written in the user's language when the question was delivered, so
 no model or tool runs after the user is gone.
+
+**Searches are reported** with their arguments (`ToolOutcome.search`), so
+short-term memory (SAV-18) can keep the filters behind the last results and a
+follow-up such as "only the cheap ones" can repeat them with one more.
 
 **Arguments are checked** against each tool's schema, and search filters
 against the content type's declared filters (`plan_search`). A wrong argument
@@ -47,13 +56,21 @@ import json
 import logging
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Annotated, Final, Literal
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, StringConstraints, ValidationError
-from sqlalchemy import select
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    ValidationError,
+    model_validator,
+)
+from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -81,6 +98,7 @@ from app.db.models import (
     ItemStatus,
     PlatformAccount,
     SavedItem,
+    User,
     UserEntity,
 )
 from app.db.types import GeoPoint
@@ -105,12 +123,17 @@ UPDATE_ITEM_TOOL: Final = "update_item"
 SET_STATUS_TOOL: Final = "set_status"
 REQUEST_DATA_DELETION_TOOL: Final = "request_data_deletion"
 CONFIRM_DATA_DELETION_TOOL: Final = "confirm_data_deletion"
+SET_PROFILE_TOOL: Final = "set_profile"
 
 _NOT_FOUND: Final = "The user has no saved item with that id."
 _ASK_USER_FOR: Final = "ask_user_for"
 _COUNTRY: Final = "country"
 
 NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+# ISO 3166-1 alpha-2, kept in upper case like `user.country` and the search's country.
+CountryCode = Annotated[
+    str, StringConstraints(strip_whitespace=True, to_upper=True, pattern=r"^[A-Za-z]{2}$")
+]
 
 
 class Notice(StrEnum):
@@ -140,6 +163,24 @@ class PlatformRecipient:
 
     platform: str
     platform_user_id: str = field(repr=False)
+
+
+@dataclass(frozen=True)
+class SearchUsed:
+    """One search the model ran: the tool and its checked arguments.
+
+    Short-term memory keeps the searches behind the last results (the working
+    set), and the agent shows them again on the next turn, so "only the cheap
+    ones" can repeat the search with one more filter.
+
+    Attributes:
+        tool: `search_items` or `near`.
+        arguments: The arguments as JSON values, without the ones left at
+            their defaults. They hold the user's own words.
+    """
+
+    tool: str
+    arguments: Mapping[str, object] = field(repr=False)
 
 
 @dataclass(frozen=True)
@@ -187,11 +228,15 @@ class ToolContext:
             `None` if it is not known yet.
         deletion_confirmed: This message is a tap on the deletion question's
             "Yes, delete" button (record 0015, Q9); without it no deletion runs.
+        message_number: The message's number among the sender's messages,
+            from ingestion; `None` for a turn that answers no numbered
+            message, which can't confirm a deletion.
     """
 
     user_id: uuid.UUID
     country: str | None
     deletion_confirmed: bool = False
+    message_number: int | None = None
 
 
 @dataclass(frozen=True)
@@ -207,6 +252,7 @@ class ToolOutcome:
         asks_deletion_confirmation: The answer must be the fixed deletion
             question instead of the model's reply.
         completion: Set when the user's data was deleted; the turn ends with it.
+        search: The search this call ran, when it was one and it ran.
     """
 
     content: Mapping[str, object] = field(repr=False)
@@ -215,6 +261,7 @@ class ToolOutcome:
     availability_gaps: tuple[AvailabilityGap, ...] = ()
     asks_deletion_confirmation: bool = False
     completion: DeletionCompletion | None = None
+    search: SearchUsed | None = None
 
     def as_json(self) -> str:
         """Return the content as the JSON text the model reads."""
@@ -311,6 +358,25 @@ class SetStatusArguments(_Arguments):
     )
 
 
+class SetProfileArguments(_Arguments):
+    """The arguments of `set_profile`; at least one is given."""
+
+    home_area: NonEmptyText | None = Field(
+        default=None,
+        description="Where the user lives, in their own words, e.g. a district or neighbourhood.",
+    )
+    country: CountryCode | None = Field(
+        default=None,
+        description="The user's country as an ISO 3166-1 alpha-2 code, e.g. 'TR' or 'JP'.",
+    )
+
+    @model_validator(mode="after")
+    def _something_to_set(self) -> "SetProfileArguments":
+        if self.home_area is None and self.country is None:
+            raise ValueError("give home_area, country or both")
+        return self
+
+
 class NoArguments(_Arguments):
     """The arguments of a tool that takes none. The user is always the DM's sender."""
 
@@ -352,27 +418,44 @@ class Toolbox:
         self._deletion_window = deletion_window
         self._now = now
 
-    async def confirmation_delivered(
-        self, user_id: uuid.UUID, confirmation: DeletionConfirmation
-    ) -> None:
+    def deletion_request(
+        self, confirmation: DeletionConfirmation, last_message_number: int
+    ) -> PendingDeletion:
+        """Plan the request a deletion question makes confirmable once it is delivered.
+
+        Call it right before sending the question. Its deadline counts from
+        now, so storing it later never gives the user more time, and it waits
+        for the message after `last_message_number` however late it is stored.
+
+        Args:
+            confirmation: The question's language and prepared "done" message.
+            last_message_number: The number of the user's last message before
+                the question is sent; only the one after it can confirm.
+
+        Returns:
+            The request, not stored yet.
+        """
+        return PendingDeletion(
+            deadline=self._now() + self._deletion_window,
+            awaited_message=last_message_number + 1,
+            language=confirmation.language,
+            done_text=confirmation.done_text,
+        )
+
+    async def keep_deletion_request(self, user_id: uuid.UUID, request: PendingDeletion) -> None:
         """Make a delivered deletion question confirmable by the user's next message.
 
-        Call it only after the whole answer was sent (`app.agent.send.send_answer`).
+        Call it only after the whole answer was sent. Storing the same request
+        again changes nothing; one past its deadline can't be confirmed.
 
         Args:
             user_id: The DM's sender the question was sent to.
-            confirmation: The question's language and prepared "done" message.
+            request: The request planned with `deletion_request`.
 
         Raises:
             redis.exceptions.RedisError: If Redis cannot be reached.
         """
-        now = self._now()
-        pending = PendingDeletion(
-            deadline=now + self._deletion_window,
-            language=confirmation.language,
-            done_text=confirmation.done_text,
-        )
-        await self._deletion_requests.save(user_id, pending, now)
+        await self._deletion_requests.save(user_id, request, self._now())
         logger.info("data_deletion_confirmation_delivered")
 
     def for_user(self, context: ToolContext) -> "UserTools":
@@ -434,15 +517,20 @@ class UserTools:
         self._pending_deletion: PendingDeletion | None = None
 
     async def begin_turn(self) -> None:
-        """Take the user's pending deletion request out, before the turn's first tool call.
+        """Take the user's pending deletion request out, if it waits for this message.
 
-        Only this turn can confirm it. Whatever the user wrote, the request is
-        gone afterwards, so "no" or any other message cancels it.
+        Only the turn of the user's next message after the question can
+        confirm it. Whatever the user wrote, the request is gone afterwards, so
+        "no" or any other message cancels it.
 
         Raises:
             redis.exceptions.RedisError: If Redis cannot be reached.
         """
-        self._pending_deletion = await self._deletion_requests.take(self._context.user_id)
+        if self._context.message_number is None:
+            return
+        self._pending_deletion = await self._deletion_requests.take(
+            self._context.user_id, self._context.message_number
+        )
 
     def definitions(self) -> tuple[ToolDefinition, ...]:
         """Describe every tool for the model.
@@ -507,6 +595,14 @@ class UserTools:
                 ),
                 parameters=SetStatusArguments.model_json_schema(),
             ),
+            ToolDefinition(
+                name=SET_PROFILE_TOOL,
+                description=(
+                    "Remember where the user lives (their home area) or their country, when "
+                    "they tell you. Used for 'near home' and for streaming in their country."
+                ),
+                parameters=SetProfileArguments.model_json_schema(),
+            ),
         )
 
     async def call(self, tool_call: ToolCall) -> ToolOutcome:
@@ -538,6 +634,9 @@ class UserTools:
             ),
             SET_STATUS_TOOL: lambda arguments: self._set_status(
                 SetStatusArguments.model_validate(arguments)
+            ),
+            SET_PROFILE_TOOL: lambda arguments: self._set_profile(
+                SetProfileArguments.model_validate(arguments)
             ),
             REQUEST_DATA_DELETION_TOOL: lambda arguments: self._request_data_deletion(
                 NoArguments.model_validate(arguments)
@@ -573,6 +672,7 @@ class UserTools:
             for name, value in arguments.filters.items()
         }
         return await self._search(
+            SearchUsed(SEARCH_ITEMS_TOOL, _json_arguments(arguments)),
             SearchQuery(
                 user_id=self._context.user_id,
                 country=self._context.country,
@@ -584,7 +684,7 @@ class UserTools:
                 text=arguments.text,
                 platform=arguments.platform,
                 saved_after=arguments.saved_after,
-            )
+            ),
         )
 
     async def _near(self, arguments: NearArguments) -> ToolOutcome:
@@ -601,6 +701,7 @@ class UserTools:
                 return _error("Search cannot check opening hours for these items.")
             filters[hours[1]] = arguments.open_now
         return await self._search(
+            SearchUsed(NEAR_TOOL, _json_arguments(arguments)),
             SearchQuery(
                 user_id=self._context.user_id,
                 country=self._context.country,
@@ -609,10 +710,10 @@ class UserTools:
                 tags=arguments.tags,
                 filters=filters,
                 text=arguments.text,
-            )
+            ),
         )
 
-    async def _search(self, query: SearchQuery) -> ToolOutcome:
+    async def _search(self, used: SearchUsed, query: SearchQuery) -> ToolOutcome:
         try:
             async with self._sessions() as session:
                 result = await self._retriever.search(session, query)
@@ -652,6 +753,7 @@ class UserTools:
             offered_item_ids=tuple(card.item_id for card in cards),
             notices=notices,
             availability_gaps=result.availability_gaps,
+            search=used,
         )
 
     async def _get_item(self, arguments: GetItemArguments) -> ToolOutcome:
@@ -743,9 +845,24 @@ class UserTools:
             offered_item_ids=(item.id,),
         )
 
+    async def _set_profile(self, arguments: SetProfileArguments) -> ToolOutcome:
+        changes = arguments.model_dump(exclude_none=True)
+        async with self._sessions() as session, session.begin():
+            if not await lock_user(session, self._context.user_id):
+                return _error("The user's profile could not be found.")
+            await session.execute(
+                update(User).where(User.id == self._context.user_id).values(**changes)
+            )
+        if arguments.country is not None:
+            # A search later in this turn already uses the country the user just gave.
+            self._context = replace(self._context, country=arguments.country)
+        # Which fields only: where a user lives is personal data.
+        logger.info("user_profile_updated", extra={"fields": sorted(changes)})
+        return ToolOutcome(content={"saved": changes})
+
     async def _request_data_deletion(self, arguments: NoArguments) -> ToolOutcome:
         # Nothing is stored yet: the request becomes confirmable only once the
-        # question was delivered (`Toolbox.confirmation_delivered`).
+        # question was delivered (`Toolbox.keep_deletion_request`).
         # The event only, never who asked (owner update of 20 Nov 2026).
         logger.info("data_deletion_requested")
         return ToolOutcome(
@@ -814,6 +931,10 @@ async def _platform_recipients(
 
 def _error(message: str) -> ToolOutcome:
     return ToolOutcome(content={"error": message})
+
+
+def _json_arguments(arguments: BaseModel) -> dict[str, object]:
+    return arguments.model_dump(mode="json", exclude_defaults=True)
 
 
 def _validation_summary(error: ValidationError) -> str:

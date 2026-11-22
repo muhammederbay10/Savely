@@ -132,6 +132,23 @@ async def test_erasing_a_user_removes_their_share_history(
     assert await ingestion_redis.exists(shares_key(user_id)) == 0
 
 
+async def test_messages_are_numbered_in_order_until_the_user_is_erased(
+    state: RedisIngestionState, ingestion_redis: ArqRedis, user_id: uuid.UUID
+) -> None:
+    assert await state.last_message_number(user_id) == 0
+    numbers = [await state.number_message(user_id, INSTAGRAM, f"mid-{n}") for n in range(3)]
+    assert numbers == [1, 2, 3]
+    # A repeated delivery keeps its number; a message without an id always counts.
+    assert await state.number_message(user_id, INSTAGRAM, "mid-1") == 2
+    assert await state.number_message(user_id, INSTAGRAM, None) == 4
+    assert await state.last_message_number(user_id) == 4
+    assert await ingestion_redis.ttl(f"savely:ingestion:{user_id}:messages") > 0
+
+    await state.erase_user(user_id)
+
+    assert await state.last_message_number(user_id) == 0
+
+
 async def test_capture_payload_sent_later_replaces_an_earlier_one(
     state: RedisIngestionState, ingestion_redis: ArqRedis, user_id: uuid.UUID
 ) -> None:
