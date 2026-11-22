@@ -54,17 +54,27 @@ class FakeClock:
 
 @dataclass
 class MemoryDeletionRequests(DeletionRequests):
-    """Pending deletion requests in memory, with the same behaviour as the Redis store."""
+    """Pending deletion requests in memory, with the same rules as the Redis store."""
 
     requests: dict[uuid.UUID, PendingDeletion] = field(default_factory=dict)
+    used_up: dict[uuid.UUID, int] = field(default_factory=dict)
 
     async def save(self, user_id: uuid.UUID, pending: PendingDeletion, now: datetime) -> None:
+        if pending.deadline <= now or self.used_up.get(user_id, 0) >= pending.awaited_message:
+            return
+        kept = self.requests.get(user_id)
+        if kept is not None and (kept.awaited_message, kept.deadline) >= (
+            pending.awaited_message,
+            pending.deadline,
+        ):
+            return
         self.requests[user_id] = pending
 
     async def take(self, user_id: uuid.UUID, message_number: int) -> PendingDeletion | None:
         pending = self.requests.get(user_id)
         if pending is None or pending.awaited_message != message_number:
             return None
+        self.used_up[user_id] = message_number
         return self.requests.pop(user_id)
 
 

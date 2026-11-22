@@ -212,10 +212,13 @@ class _Sent:
         planned: The exchange planned before sending.
         sent_whole: Whether all of the answer was sent; if not, only the
             user's text is kept (`Exchange.cut_off`).
+        order: When it started to be sent among the user's answers, so a
+            late store doesn't replace a newer answer's working set.
     """
 
     planned: Exchange
     sent_whole: bool
+    order: int
 
     def exchange(self) -> Exchange:
         return self.planned if self.sent_whole else self.planned.cut_off()
@@ -329,10 +332,10 @@ class ChatResponder:
         self, user_id: uuid.UUID, receipt_id: uuid.UUID, reply: Reply
     ) -> _Sent | ChatOutcome:
         """Find what is left of an answer an earlier try started to send."""
-        if reply.state is ReplyState.STORED or reply.planned is None:
+        if reply.state is ReplyState.STORED or reply.planned is None or reply.order is None:
             return ChatOutcome.ALREADY_SENT
         if reply.state is ReplyState.DELIVERED:
-            return _Sent(reply.planned, sent_whole=reply.sent_whole is True)
+            return _Sent(reply.planned, sent_whole=reply.sent_whole is True, order=reply.order)
         # Still `sending`: whether it arrived is unknown, unless its rows prove it,
         # because they are written only after the answer was sent.
         planned_messages = len(reply.planned.messages)
@@ -341,7 +344,7 @@ class ChatResponder:
         )
         if stored == 0:
             return ChatOutcome.ALREADY_SENT
-        return _Sent(reply.planned, sent_whole=stored == planned_messages)
+        return _Sent(reply.planned, sent_whole=stored == planned_messages, order=reply.order)
 
     async def _retry_or_fail(
         self, prepared: _Prepared | None, error: Exception, *, last_try: bool
@@ -376,7 +379,8 @@ class ChatResponder:
             planned = self._exchange(
                 prepared, answer, deletion_request(self._toolbox, answer, last_message_number)
             )
-            if not await self._memory.start_reply(prepared.user_id, prepared.receipt_id, planned):
+            order = await self._memory.start_reply(prepared.user_id, prepared.receipt_id, planned)
+            if order is None:
                 return ChatOutcome.ALREADY_SENT
             try:
                 report = await self._sender.send(
@@ -387,7 +391,7 @@ class ChatResponder:
             except MessengerError as error:
                 logger.warning("chat_answer_send_failed", extra={"error": type(error).__name__})
                 return ChatOutcome.SEND_FAILED
-        return _Sent(planned, sent_whole=report.complete)
+        return _Sent(planned, sent_whole=report.complete, order=order)
 
     async def _send_after_deletion(self, prepared: _Prepared, answer: AgentAnswer) -> ChatOutcome:
         """Send the "done" message; the user is gone, so nothing is held, marked or stored."""
@@ -472,7 +476,7 @@ class ChatResponder:
                 return
             if exchange.deletion_request is not None:
                 await self._toolbox.keep_deletion_request(user_id, exchange.deletion_request)
-            await self._memory.remember(user_id, receipt_id, exchange)
+            await self._memory.remember(user_id, receipt_id, exchange, sent.order)
 
     async def _fail(self, prepared: _Prepared | None, error: Exception) -> ChatOutcome:
         """Send the bot's error message, if the message and its sender are known."""
@@ -482,7 +486,7 @@ class ChatResponder:
         async with self._conversations.hold(prepared.user_id) as held:
             if held is None:
                 return ChatOutcome.NO_USER
-            if not await self._memory.start_reply(prepared.user_id, prepared.receipt_id, None):
+            if await self._memory.start_reply(prepared.user_id, prepared.receipt_id, None) is None:
                 return ChatOutcome.ALREADY_SENT
             wording = _error_wording(prepared.profile.language)
             try:

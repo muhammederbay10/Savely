@@ -663,7 +663,9 @@ For each text ([`app/agent/chat.py`](../app/agent/chat.py)):
 
 1. Postgres: the `conversation_msg` rows, with ids made from the message's receipt, and `user.language` when they are new. The rows are written only after sending, so they also prove the answer was sent.
 2. Redis: the reply moves from `sending` to `delivered`, in one step that changes nothing if the reply was erased.
-3. Redis, holding the user: the deletion request becomes confirmable, and the history and working set are stored in the transaction that marks the reply `stored`.
+3. Redis, holding the user: the deletion request becomes confirmable, and the history and working set are stored in the script that marks the reply `stored`.
+
+**A late store never undoes newer state.** Each answer gets a delivery order when its sending starts. When an older answer is stored after newer ones, its messages are merged into the history by time (keeping the last `SESSION_HISTORY_MESSAGES`, with no duplicates), and its working set is kept only if no answer sent later set one. Its deletion request is stored only if no newer request is there and it wasn't already used up: taking a request leaves a used-up mark until its deadline. So a late retry can't make an old question confirmable again, replace a newer question, or change the list "the second one" refers to.
 
 Every step can be repeated without doubling anything. If a store stays down, the job runs again later and only stores, without running the agent or sending: it finds a `delivered` mark, or a `sending` mark next to the exchange's rows in Postgres. A `sending` mark without rows means it can't tell whether the answer arrived, so it stores nothing; that happens only when both stores failed after sending. The last try gives up (`chat_exchange_not_stored`).
 

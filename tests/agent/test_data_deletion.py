@@ -634,6 +634,41 @@ async def test_a_request_is_taken_only_by_the_message_it_waits_for(stores: Store
         await stores.requests.erase_user(user_id, ())
 
 
+def pending_deletion(stores: Stores, awaited: int, *, minutes: int = 10) -> PendingDeletion:
+    return PendingDeletion(
+        deadline=stores.clock.now + timedelta(minutes=minutes),
+        awaited_message=awaited,
+        language="en",
+        done_text=f"done {awaited} {minutes}",
+    )
+
+
+async def test_a_request_stored_again_never_comes_back_or_replaces_a_newer_one(
+    stores: Stores,
+) -> None:
+    user_id = uuid.uuid4()
+    first, newer = pending_deletion(stores, 5), pending_deletion(stores, 7)
+    now = stores.clock.now
+
+    try:
+        await stores.requests.save(user_id, first, now)
+        assert await stores.requests.take(user_id, 5) == first
+        # Used up: storing it again, as a late retry would, changes nothing.
+        await stores.requests.save(user_id, first, now)
+        assert await stores.requests.take(user_id, 5) is None
+
+        await stores.requests.save(user_id, newer, now)
+        await stores.requests.save(user_id, first, now)
+        await stores.requests.save(user_id, pending_deletion(stores, 7, minutes=5), now)
+        assert await stores.requests.take(user_id, 7) == newer
+
+        # A request past its deadline is not stored.
+        await stores.requests.save(user_id, pending_deletion(stores, 9, minutes=-1), now)
+        assert await stores.requests.take(user_id, 9) is None
+    finally:
+        await stores.requests.erase_user(user_id, ())
+
+
 async def test_a_failing_store_leaves_postgres_unchanged_and_a_repeat_succeeds(
     stores: Stores,
 ) -> None:

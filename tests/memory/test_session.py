@@ -55,8 +55,12 @@ def exchange(*numbers: int, results: WorkingSet | None = None) -> Exchange:
 async def remember(
     memory: SessionMemory, user_id: uuid.UUID, numbers: list[int], results: WorkingSet | None
 ) -> None:
-    """Store one answered message's exchange."""
-    await memory.remember(user_id, uuid.uuid4(), exchange(*numbers, results=results))
+    """Send and store one answered message's exchange, in order."""
+    receipt_id = uuid.uuid4()
+    answered = exchange(*numbers, results=results)
+    order = await memory.start_reply(user_id, receipt_id, answered)
+    assert order is not None
+    await memory.remember(user_id, receipt_id, answered, order)
 
 
 async def test_an_exchange_and_its_working_set_are_read_back(
@@ -139,9 +143,9 @@ async def test_only_the_first_try_may_start_a_reply(
     assert await memory.reply(user_id, receipt_id) is None
     assert await memory.start_reply(user_id, receipt_id, first)
     assert not await memory.start_reply(user_id, receipt_id, second)
-    assert await memory.reply(user_id, receipt_id) == Reply(ReplyState.SENDING, first)
-    assert await memory.start_reply(user_id, other_receipt_id, None)
-    assert await memory.reply(user_id, other_receipt_id) == Reply(ReplyState.SENDING)
+    assert await memory.reply(user_id, receipt_id) == Reply(ReplyState.SENDING, first, order=1)
+    assert await memory.start_reply(user_id, other_receipt_id, None) == 2
+    assert await memory.reply(user_id, other_receipt_id) == Reply(ReplyState.SENDING, order=2)
 
 
 async def test_a_reply_goes_from_sending_to_delivered_to_stored_with_its_exchange(
@@ -150,20 +154,44 @@ async def test_a_reply_goes_from_sending_to_delivered_to_stored_with_its_exchang
     memory = SessionMemory(ingestion_redis, lifetime=DAY, max_messages=20)
     receipt_id = uuid.uuid4()
     sent = exchange(1, 2, results=working_set(uuid.uuid4(), uuid.uuid4()))
-    await memory.start_reply(user_id, receipt_id, sent)
+    order = await memory.start_reply(user_id, receipt_id, sent)
+    assert order == 1
 
     await memory.reply_delivered(user_id, receipt_id, sent_whole=True)
-    assert await memory.reply(user_id, receipt_id) == Reply(ReplyState.DELIVERED, sent, True)
+    delivered = Reply(ReplyState.DELIVERED, sent, sent_whole=True, order=order)
+    assert await memory.reply(user_id, receipt_id) == delivered
     # Only a reply that is still being sent moves on.
     await memory.reply_delivered(user_id, receipt_id, sent_whole=False)
-    assert await memory.reply(user_id, receipt_id) == Reply(ReplyState.DELIVERED, sent, True)
+    assert await memory.reply(user_id, receipt_id) == delivered
     assert (await memory.load(user_id)).history == ()
 
-    await memory.remember(user_id, receipt_id, sent)
+    await memory.remember(user_id, receipt_id, sent, order)
     assert await memory.reply(user_id, receipt_id) == Reply(ReplyState.STORED)
     assert await memory.load(user_id) == Session(
         history=(message(1), message(2)), working_set=sent.working_set
     )
+
+
+async def test_an_exchange_stored_late_lands_in_its_place_once_and_keeps_newer_results(
+    ingestion_redis: ArqRedis, user_id: uuid.UUID
+) -> None:
+    memory = SessionMemory(ingestion_redis, lifetime=DAY, max_messages=3)
+    older_id, newer_id = uuid.uuid4(), uuid.uuid4()
+    older = exchange(1, 2, results=working_set(uuid.uuid4()))
+    newer = exchange(3, 4, results=working_set(uuid.uuid4()))
+    older_order = await memory.start_reply(user_id, older_id, older)
+    newer_order = await memory.start_reply(user_id, newer_id, newer)
+    assert older_order is not None and newer_order is not None
+
+    await memory.remember(user_id, newer_id, newer, newer_order)
+    for _ in range(2):  # the older answer's store is tried again
+        await memory.remember(user_id, older_id, older, older_order)
+
+    session = await memory.load(user_id)
+    # Merged by time, the oldest dropped beyond three messages, nothing twice.
+    assert session.history == (message(2), message(3), message(4))
+    assert session.working_set == newer.working_set
+    assert await memory.reply(user_id, older_id) == Reply(ReplyState.STORED)
 
 
 async def test_a_delivery_of_an_erased_reply_writes_nothing(

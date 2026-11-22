@@ -24,6 +24,7 @@ from sqlalchemy import event
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, async_sessionmaker
 
+from app.agent.agent import AgentAnswer, AgentTurn
 from app.agent.chat import ChatOutcome, RetryLaterError
 from app.agent.replies.templates import (
     DELETION_CONFIRM_PAYLOAD,
@@ -46,6 +47,7 @@ from app.memory.session import ReplyState, Session
 from app.models.errors import ModelRequestError, ModelUnavailableError
 from tests.agent.agent_support import CONFIRM_SECONDS, MAX_STEPS, final_answer, tool_calls
 from tests.agent.chat_support import (
+    FIRST_TEXT_AT,
     ChatStores,
     ChatUnderTest,
     build_chat,
@@ -382,6 +384,63 @@ async def test_a_question_whose_request_is_saved_by_a_later_try_keeps_its_messag
     else:
         assert await stored_user(chat_stores, user_id) is not None
         assert chat.sent_texts()[-1] == "Nothing was deleted."
+
+
+async def test_an_older_questions_late_storing_never_replaces_a_newer_question(
+    chat_stores: ChatStores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user_id = await chat_stores.new_user(SENDER_ID)
+    chat = build_chat(
+        chat_stores,
+        [
+            REQUEST,
+            final_answer("en", "…"),
+            final_answer("en", "Kept."),
+            REQUEST,
+            final_answer("en", "…"),
+            CONFIRM,
+        ],
+    )
+    outage = failing(monkeypatch, chat_stores.memory, "remember", times=None)
+    first_question = await chat_stores.send_text(user_id, "delete my data")
+    # Question A is sent and its request stored; the rest fails for the whole run.
+    with pytest.raises(RetryLaterError):
+        await chat.responder.respond(user_id, first_question, last_try=False)
+    outage.clear()
+    declined = await chat_stores.send_text(user_id, "No, keep my data")
+    await chat.responder.respond(user_id, declined, last_try=False)
+    await ask_to_delete(chat_stores, chat, user_id)
+
+    # A's storing is tried again after question B was delivered.
+    assert await chat.responder.respond(user_id, first_question, last_try=False) is (
+        ChatOutcome.ANSWERED
+    )
+    tapped = await tap_yes_delete(chat_stores, user_id)
+    await chat.responder.respond(user_id, tapped, last_try=False)
+
+    assert await stored_user(chat_stores, user_id) is None
+    assert chat.sent_texts() == [QUESTION, "Kept.", QUESTION, DONE]
+
+
+async def test_an_older_questions_late_storing_never_brings_back_a_used_up_request(
+    chat_stores: ChatStores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user_id = await chat_stores.new_user(SENDER_ID)
+    chat = build_chat(chat_stores, [REQUEST, final_answer("en", "…"), final_answer("en", "Kept.")])
+    outage = failing(monkeypatch, chat_stores.memory, "remember", times=None)
+    question = await chat_stores.send_text(user_id, "delete my data")
+    with pytest.raises(RetryLaterError):
+        await chat.responder.respond(user_id, question, last_try=False)
+    outage.clear()
+    declined = await chat_stores.send_text(user_id, "No, keep my data")
+    declined_number = await chat_stores.state.last_message_number(user_id)
+    await chat.responder.respond(user_id, declined, last_try=False)
+
+    assert await chat.responder.respond(user_id, question, last_try=False) is (ChatOutcome.ANSWERED)
+
+    # The "no" used the request up; storing the question late doesn't put it back.
+    assert await chat_stores.requests.take(user_id, declined_number) is None
+    assert chat.sent_texts() == [QUESTION, "Kept."]
 
 
 async def test_a_tap_whose_job_is_retried_later_still_deletes(
@@ -745,6 +804,71 @@ async def test_an_answer_recorded_only_in_postgres_is_not_brought_back_after_a_d
     stored = await all_stored_bytes(redis_url)
     assert str(user_id).encode() not in stored
     assert marker.encode() not in stored
+
+
+async def test_an_older_answers_late_storing_keeps_the_newer_results_and_the_order(
+    chat_stores: ChatStores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user_id = await chat_stores.new_user(SENDER_ID)
+    older = await seed_place(
+        chat_stores, user_id, "Synthetic Meze", district="Bebek", price="cheap", saved_days_ago=2
+    )
+    newer = await seed_place(
+        chat_stores,
+        user_id,
+        "Synthetic Köfte",
+        district="Beşiktaş",
+        price="cheap",
+        saved_days_ago=1,
+    )
+    search = tool_calls((SEARCH_ITEMS_TOOL, {"category": "restaurant"}))
+    chat = build_chat(
+        chat_stores,
+        [
+            search,
+            final_answer("en", "Older list:", [older.id]),
+            search,
+            final_answer("en", "Newer list:", [newer.id]),
+            final_answer("en", "That one."),
+        ],
+    )
+    turns: list[AgentTurn] = []
+    answer = chat.agent.agent.answer
+
+    async def recording(turn: AgentTurn) -> AgentAnswer:
+        turns.append(turn)
+        return await answer(turn)
+
+    monkeypatch.setattr(chat.agent.agent, "answer", recording)
+    # Each reply is written half a minute after its question, in one timeline.
+    chat_stores.clock.now = FIRST_TEXT_AT + timedelta(seconds=30)
+    outage = failing(monkeypatch, chat_stores.memory, "remember", times=None)
+    first = await chat_stores.send_text(user_id, "restaurants in Bebek")
+    with pytest.raises(RetryLaterError):
+        await chat.responder.respond(user_id, first, last_try=False)
+    outage.clear()
+    chat_stores.clock.advance(60)
+    second = await chat_stores.send_text(user_id, "restaurants in Beşiktaş")
+    await chat.responder.respond(user_id, second, last_try=False)
+
+    for _ in range(2):  # a repeated late try changes nothing more
+        await chat.responder.respond(user_id, first, last_try=False)
+
+    session = await chat_stores.memory.load(user_id)
+    assert session.working_set is not None
+    assert session.working_set.item_ids == (newer.id,)
+    assert [(message.role, message.content) for message in session.history] == [
+        ("user", "restaurants in Bebek"),
+        ("assistant", "Older list:"),
+        ("user", "restaurants in Beşiktaş"),
+        ("assistant", "Newer list:"),
+    ]
+    follow_up = await chat_stores.send_text(user_id, "the first one")
+    await chat.responder.respond(user_id, follow_up, last_try=False)
+    assert tuple(turns[-1].working_set) == (newer.id,)
+    # No answer was sent again.
+    assert chat.sent_texts().count("Older list:") == 1
+    assert chat.sent_texts().count("Newer list:") == 1
 
 
 async def test_a_last_try_that_cannot_store_gives_up_without_an_error_message(
