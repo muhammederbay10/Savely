@@ -1,18 +1,24 @@
 """SQL conditions on `saved_item` for each part of a search, and the orders results come in.
 
-Each condition is checked on one user's items. Conditions on entities look at
-the entities linked to the item, so a list post matches when any of its
-places or movies does. Where a filter reads its values is declared by the
-content type (`FilterSource`); nothing here names a type or a filter.
+Each condition is checked on one user's items. Type filters are checked per
+mention (`fields.entities`), so a list post matches when any one of its places
+or movies meets them all. A mention with a linked entity is judged by the
+entity's verified data; a mention without one by what the post said, such as
+its area hint (decision record 0017). Where a filter reads its values is
+declared by the content type (`FilterSource`); nothing here names a type or a
+filter.
 
 Values come normalized (`filter_normalization`), so they are compared exactly,
 the way they are stored, and the JSON indexes can be used.
 """
 
+import sys
+import unicodedata
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from functools import cache
 from typing import Any, Final
 
 from sqlalchemy import (
@@ -21,8 +27,11 @@ from sqlalchemy import (
     Float,
     Text,
     and_,
+    any_,
     bindparam,
+    case,
     cast,
+    column,
     false,
     func,
     literal,
@@ -32,8 +41,9 @@ from sqlalchemy import (
     select,
     true,
 )
-from sqlalchemy.dialects.postgresql import JSONB, TSQUERY
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, TSQUERY
 from sqlalchemy.orm import QueryableAttribute
+from sqlalchemy.sql.selectable import TableValuedAlias
 
 from app.agent.search.query import FilterValue, Near
 from app.db.models import (
@@ -48,7 +58,7 @@ from app.db.models import (
     saved_item_search_vector,
 )
 from app.db.types import GeographyPoint, Vector
-from app.types.base import FilterKind, FilterSource, SearchFilter
+from app.types.base import MENTIONS_FIELD, FilterKind, FilterSource, SearchFilter
 
 # The address levels of a place, from the widest to the narrowest. An area filter
 # matches any of them (record 0005).
@@ -63,7 +73,7 @@ ADDRESS_LEVELS: Final = (
 WIDENED_LEVELS: Final = (Entity.district, Entity.neighbourhood)
 
 # The key of a post's mentions in `saved_item.fields`: `EntityExtraction.entities`.
-MENTIONS_KEY: Final = "entities"
+MENTIONS_KEY: Final = MENTIONS_FIELD
 
 # The offer kinds of a providers object (`{"<offer kind>": ["<provider name>", …]}`, TMDB's
 # watch-provider kinds) under which a title counts as "on" a platform: watchable without
@@ -71,6 +81,14 @@ MENTIONS_KEY: Final = "entities"
 # filter. Owner decision on SAV-16, 18 Nov 2026 (comment 01a1efd3-a638-7119-b6ed-616d0f2c9576).
 WATCHABLE_OFFER_KINDS: Final = ("flatrate", "free", "ads")
 _LIKE_ESCAPE: Final = "\\"
+
+# The words in the Unicode name of a punctuation mark that separates the levels of an
+# area hint: every comma and semicolon of every script, e.g. "," in "Kadıköy, İstanbul",
+# "、" in "渋谷、東京" or "،" in Arabic. Hyphens, slashes, apostrophes and full stops
+# are not separators, because they appear inside names ("Saint-Germain-des-Prés",
+# "St. John's"). Decision record 0017.
+_AREA_HINT_SEPARATOR_WORDS: Final = frozenset({"COMMA", "SEMICOLON"})
+_OTHER_PUNCTUATION: Final = "Po"
 
 
 def owned_by(user_id: uuid.UUID) -> ColumnElement[bool]:
@@ -133,21 +151,28 @@ class FilterContext:
 
 @dataclass(frozen=True)
 class FilterPredicates:
-    """When one of a type's filters holds, on the item itself or on one linked entity.
+    """When one of a type's filters holds: on the item itself, or on one of its mentions.
 
-    A list post links several entities. Every filter of a search must hold on
-    the **same** entity, so two titles cannot each satisfy half of the filters.
-    A value stored on the item itself (`saved_item.fields`) holds for all of
-    its entities.
+    A list post has several mentions. Every filter of a search must hold on
+    the **same** mention, so two titles cannot each satisfy half of the
+    filters. A mention with a linked entity is judged by `on_entity`, one
+    without by `on_mention`; so once a resolver links an entity, its verified
+    data wins over what the post said. A value stored on the item itself
+    (`saved_item.fields`) holds for all of its mentions.
 
     Attributes:
         on_item: The filter holds by the item's own fields; `None` if it never can.
-        on_entity: The filter holds by one linked entity, written on `Entity`;
-            `None` if entities never decide it.
+        on_entity: The filter holds by one linked entity, written on `Entity`
+            and, for its own mention, on `ItemEntity.position`; `None` if
+            entities never decide it.
+        on_mention: The filter holds by one mention with no linked entity,
+            written on `unresolved_mention()`; `None` if such a mention never
+            decides it, e.g. for streaming or distance, which need an entity.
     """
 
     on_item: ColumnElement[bool] | None
     on_entity: ColumnElement[bool] | None
+    on_mention: ColumnElement[bool] | None = None
 
 
 def filter_predicates(
@@ -179,15 +204,29 @@ def filter_predicates(
     if isinstance(value, Near):
         return near_predicates(value)
     if search_filter.kind is FilterKind.AREA:
-        return area_predicates(str(value))
+        return area_predicates(str(value), search_filter.mention_field)
     if search_filter.kind is FilterKind.TEXT:
         return _text_predicates(search_filter.name, str(value), item_wide=item_wide)
     return _value_predicates(search_filter.name, value, item_wide=item_wide)
 
 
-def area_predicates(area: str) -> FilterPredicates:
-    """Hold for an entity whose address has the area at any level."""
-    return FilterPredicates(None, or_(*(level == area for level in ADDRESS_LEVELS)))
+def area_predicates(area: str, mention_field: str | None) -> FilterPredicates:
+    """Hold for an entity whose address has the area at any level, or a mention whose hint has it.
+
+    Args:
+        area: The normalized area.
+        mention_field: The key of a mention that holds where the post said it
+            is. A mention with no linked entity holds when one part of that
+            hint is the area (`area_hint_parts`). `None` if mentions never decide.
+
+    Returns:
+        The predicates on one linked entity and on one mention without an entity.
+    """
+    on_entity = or_(*(level == area for level in ADDRESS_LEVELS))
+    if mention_field is None:
+        return FilterPredicates(None, on_entity)
+    on_mention = literal(area, Text) == any_(area_hint_parts(mention_field))
+    return FilterPredicates(None, on_entity, on_mention)
 
 
 def city_predicates(cities: Sequence[tuple[str | None, str]]) -> FilterPredicates:
@@ -219,10 +258,11 @@ def near_predicates(near: Near) -> FilterPredicates:
 
 
 def all_filters_hold(predicates: Sequence[FilterPredicates]) -> ColumnElement[bool]:
-    """Keep the items on which every filter holds, all on the same linked entity.
+    """Keep the items on which every filter holds, all on the same mention.
 
-    An item matches when its own fields satisfy every filter, or when one of
-    its entities satisfies every filter its fields do not.
+    An item matches when its own fields satisfy every filter, when one of its
+    linked entities satisfies every filter its fields do not, or when one of
+    its mentions with no linked entity does.
 
     Args:
         predicates: One per filter of the search.
@@ -232,24 +272,139 @@ def all_filters_hold(predicates: Sequence[FilterPredicates]) -> ColumnElement[bo
     """
     if not predicates:
         return true()
-    per_entity = and_(*(_on_item_or_entity(predicate) for predicate in predicates))
-    on_one_entity = (
+    alternatives = [_on_one_entity(predicates)]
+    on_one_unresolved_mention = _on_one_unresolved_mention(predicates)
+    if on_one_unresolved_mention is not None:
+        alternatives.append(on_one_unresolved_mention)
+    item_conditions = [predicate.on_item for predicate in predicates]
+    if all(condition is not None for condition in item_conditions):
+        alternatives.insert(
+            0, and_(*(condition for condition in item_conditions if condition is not None))
+        )
+    return or_(*alternatives)
+
+
+def _on_one_entity(predicates: Sequence[FilterPredicates]) -> ColumnElement[bool]:
+    per_entity = and_(
+        *(_either(predicate.on_item, predicate.on_entity) for predicate in predicates)
+    )
+    return (
         select(ItemEntity.saved_item_id)
         .join(Entity, Entity.id == ItemEntity.entity_id)
         .where(ItemEntity.saved_item_id == SavedItem.id, per_entity)
         .exists()
     )
-    item_conditions = [predicate.on_item for predicate in predicates]
-    if any(condition is None for condition in item_conditions):
-        return on_one_entity
-    return or_(
-        and_(*(condition for condition in item_conditions if condition is not None)), on_one_entity
+
+
+def _on_one_unresolved_mention(
+    predicates: Sequence[FilterPredicates],
+) -> ColumnElement[bool] | None:
+    """One mention with no linked entity meets every filter; `None` if no such mention can.
+
+    No such mention can meet a filter that needs an entity, such as streaming
+    or distance. And when no filter reads mentions, a mention could only match
+    by the item's own fields, which the item-wide alternative already covers.
+    """
+    if any(predicate.on_item is None and predicate.on_mention is None for predicate in predicates):
+        return None
+    if all(predicate.on_mention is None for predicate in predicates):
+        return None
+    per_mention = and_(
+        *(_either(predicate.on_item, predicate.on_mention) for predicate in predicates)
+    )
+    mention = unresolved_mention()
+    return (
+        select(mention.c.value)
+        .where(mention_is_unresolved(), per_mention)
+        .correlate(SavedItem)
+        .exists()
     )
 
 
-def _on_item_or_entity(predicate: FilterPredicates) -> ColumnElement[bool]:
-    parts = [part for part in (predicate.on_item, predicate.on_entity) if part is not None]
+def _either(*conditions: ColumnElement[bool] | None) -> ColumnElement[bool]:
+    parts = [condition for condition in conditions if condition is not None]
     return or_(*parts) if parts else false()
+
+
+@cache
+def unresolved_mention() -> TableValuedAlias:
+    """Each mention of the item in `fields.entities`, with its 1-based `ordinality`.
+
+    Used in a subquery on `saved_item`, together with `mention_is_unresolved()`.
+    The rows are mentions of any kind; the caller keeps those without a linked
+    entity. It is built once, so every condition refers to the same rows.
+
+    Returns:
+        A table-valued function with the columns `value` (the mention's JSON)
+        and `ordinality`.
+    """
+    mentions = _mention_list()
+    # A field that is not a list (or is missing) yields no mentions instead of an error.
+    as_list = case((func.jsonb_typeof(mentions) == "array", mentions))
+    return (
+        func.jsonb_array_elements(as_list)
+        .table_valued(column("value", JSONB), with_ordinality="ordinality")
+        .render_derived(name="mention")
+    )
+
+
+def mention_is_unresolved() -> ColumnElement[bool]:
+    """No entity is linked to the current mention of `unresolved_mention()`.
+
+    The resolver links the entity of the mention at index `i` of
+    `fields.entities` with `item_entity.position = i`.
+    """
+    mention = unresolved_mention()
+    linked = (
+        select(ItemEntity.saved_item_id)
+        .where(
+            ItemEntity.saved_item_id == SavedItem.id,
+            ItemEntity.position == mention.c.ordinality - 1,
+        )
+        # `saved_item` is the outer query's row, two levels up, so only `item_entity` is
+        # this subquery's own table.
+        .correlate_except(ItemEntity)
+        .exists()
+    )
+    return not_(linked)
+
+
+def area_hint_parts(mention_field: str) -> ColumnElement[list[str]]:
+    """The parts of the current mention's area hint, split on its separators.
+
+    "Kadıköy, İstanbul" → ["Kadıköy", "İstanbul"]; "渋谷、東京" → ["渋谷", "東京"].
+    A hint with no separator is one part. Parts are trimmed and compared as
+    they are stored, so normalization offers exactly these values.
+
+    Args:
+        mention_field: The key of the mention that holds the hint.
+
+    Returns:
+        A text array; null when the mention has no hint.
+    """
+    hint = unresolved_mention().c.value.op("->>", return_type=Text)(mention_field)
+    separators = literal(area_hint_separator_pattern(), Text)
+    return func.regexp_split_to_array(func.btrim(hint), separators, type_=ARRAY(Text))
+
+
+@cache
+def area_hint_separator_pattern() -> str:
+    """The Postgres regular expression that splits an area hint into its levels.
+
+    It matches one comma or semicolon of any script, with the white space
+    around it. The marks come from the Unicode names, not from a list.
+    """
+    separators = "".join(f"\\U{ord(mark):08x}" for mark in _area_hint_separators())
+    return rf"\s*[{separators}]\s*"
+
+
+def _area_hint_separators() -> list[str]:
+    return [
+        mark
+        for mark in map(chr, range(sys.maxunicode + 1))
+        if unicodedata.category(mark) == _OTHER_PUNCTUATION
+        and not _AREA_HINT_SEPARATOR_WORDS.isdisjoint(unicodedata.name(mark, "").split())
+    ]
 
 
 def distance_from(near: Near) -> ColumnElement[float]:
@@ -298,10 +453,15 @@ def keyword_rank(query: ColumnElement[str]) -> ColumnElement[float]:
 
 
 def _value_predicates(key: str, value: FilterValue, *, item_wide: bool) -> FilterPredicates:
-    """The value under `key`, alone or in a list: item-wide, or on the entity or its mention."""
+    """The value under `key`, alone or in a list: item-wide, or on one mention.
+
+    A mention with a linked entity holds by the entity's data or by its own
+    mention, one without by the mention alone.
+    """
     on_entity = or_(_holds_value(Entity.data, key, value), _holds_value(_own_mention(), key, value))
+    on_mention = _holds_value(unresolved_mention().c.value, key, value)
     on_item = _holds_value(SavedItem.fields, key, value) if item_wide else None
-    return FilterPredicates(on_item, on_entity)
+    return FilterPredicates(on_item, on_entity, on_mention)
 
 
 def _text_predicates(key: str, value: str, *, item_wide: bool) -> FilterPredicates:
@@ -310,10 +470,15 @@ def _text_predicates(key: str, value: str, *, item_wide: bool) -> FilterPredicat
         Entity.data[key].astext.ilike(pattern, escape=_LIKE_ESCAPE),
         _own_mention().op("->>", return_type=Text)(key).ilike(pattern, escape=_LIKE_ESCAPE),
     )
+    on_mention = (
+        unresolved_mention()
+        .c.value.op("->>", return_type=Text)(key)
+        .ilike(pattern, escape=_LIKE_ESCAPE)
+    )
     on_item = (
         SavedItem.fields[key].astext.ilike(pattern, escape=_LIKE_ESCAPE) if item_wide else None
     )
-    return FilterPredicates(on_item, on_entity)
+    return FilterPredicates(on_item, on_entity, on_mention)
 
 
 def _holds_value(
@@ -331,9 +496,12 @@ def _own_mention() -> ColumnElement[Any]:
     The resolver links the entity of the mention at index `i` of
     `fields.entities` with `item_entity.position = i`.
     """
-    return SavedItem.fields.op("->", return_type=JSONB)(literal(MENTIONS_KEY)).op(
-        "->", return_type=JSONB
-    )(ItemEntity.position)
+    return _mention_list().op("->", return_type=JSONB)(ItemEntity.position)
+
+
+def _mention_list() -> ColumnElement[Any]:
+    """The item's mentions, `fields.entities`."""
+    return SavedItem.fields.op("->", return_type=JSONB)(literal(MENTIONS_KEY))
 
 
 def _available_in_country(provider: str, country: str | None) -> ColumnElement[bool]:

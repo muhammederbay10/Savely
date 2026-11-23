@@ -576,7 +576,7 @@ async def _relaxed_conditions(
                 kept.append(city_predicates(cities))
                 relaxed.append(slot)
             else:
-                kept.append(area_predicates(str(value)))
+                kept.append(area_predicates(str(value), typed.search_filter.mention_field))
         else:
             relaxed.append(slot)
     conditions.append(all_filters_hold(kept))
