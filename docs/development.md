@@ -456,8 +456,8 @@ A **built-in type** exists only where a kind of post gets extra behaviour: more 
 
 | Built-in type | Fields added to the schema | Resolver | Extra search filters |
 |---|---|---|---|
-| `place` | per venue: `name`, `area_hint`, `cuisine` | `google_places` | `area`, `near`, `open_now`, `cuisine`, `price` |
-| `movie` (also series) | per title: `title`, `year_hint` | `tmdb` | `genre`, `year`, `streaming`, `watched` |
+| `place` | per venue: `name`, `area_hint`, `cuisine` | `google_places` (Phase 2) | `area` (the entity's address, or the mention's `area_hint`), `near`, `open_now`, `cuisine`, `price` |
+| `movie` (also series) | per title: `title`, `year_hint` | `tmdb` (Phase 2) | `genre`, `year`, `streaming`, `watched` |
 | `study` | `subject`, `topic`, `format`, `key_points`, `resources`, `exam` | none | `subject`, `topic`, `format`, `exam` |
 | *(no built-in type)* | none: `summary`, `category` and `tags` only | none | none |
 
@@ -535,7 +535,9 @@ result.availability_gaps   # (movie, country) rows to fetch or refresh (SAV-15)
 2. **Normalize** what the user wrote to a value in **their own** saves: an exact hit (their value, or a canonical value or verified alias in the vocabulary) needs no model call; otherwise Gemini Decision 1 picks one of their values or "none of these". No other user's values are ever read, and search never writes to the vocabulary.
 3. **L0:** SQL/PostGIS filters, then pgvector ranking by the query text. The type's filters must all hold on the same place or title of a list post. Without a text, places near a point come nearest first, and everything else newest first.
 4. **L1:** if the embedding or the vector search fails, the same filters plus Postgres full-text search on the caption, summary and transcript.
-5. **L2:** with fewer than `SEARCH_MIN_RESULTS` results, a district or neighbourhood widens to its city, tags and the type's other filters are dropped (a keyword match from L1 is kept), and items that are not fully indexed yet are searched by the words of the query. The result lists what was relaxed.
+5. **L2:** with fewer than `SEARCH_MIN_RESULTS` results, a district or neighbourhood of a linked place widens to its city for linked places (mentions without an entity keep matching the area as written), tags and the type's other filters are dropped (a keyword match from L1 is kept), and items that are not fully indexed yet are searched by the words of the query. The result lists what was relaxed.
+
+**Where filters read their values.** Each mention of a post (`fields.entities[i]`) is judged on its own. A mention linked to an entity (`item_entity.position = i`) is judged by the entity: an area by its address levels, a cuisine or genre by `entity.data` or the mention itself. A mention with no entity, which is every place in Phase 1 because the resolvers come in Phase 2, is judged by what the post said: `cuisine` by the mention's own value, and `area` by the parts of its `area_hint`. The hint is split on any comma or semicolon of any script (",", "،", "、", "，", "；" …), so "Kadıköy, İstanbul" matches both "Kadıköy" and "İstanbul", and "渋谷、東京" matches "渋谷" and "東京". Hyphens, slashes and full stops stay inside a part ("Saint-Germain-des-Prés"), and the whole hint is never a value of its own. Normalization offers the same parts, from the asking user's own mentions only. Filters that need an entity (`near`, `open_now`, `streaming`, `watched`) never match a mention without one (decision record 0017).
 
 Every step up the ladder is logged as `search_fallback` with its level and reason, never with the query's text. The whole search runs within `SEARCH_TIME_BUDGET_SECONDS`; when it runs out, the result has what was found and `incomplete=True`.
 

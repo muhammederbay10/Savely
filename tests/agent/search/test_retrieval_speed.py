@@ -9,6 +9,7 @@ import statistics
 import time
 import uuid
 
+import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.search.fallback import FallbackLevel
@@ -30,7 +31,8 @@ def _vector(seed: int) -> list[float]:
     return [value / length for value in raw]
 
 
-async def _seed(session: AsyncSession) -> uuid.UUID:
+async def _seed(session: AsyncSession, *, resolved: bool) -> uuid.UUID:
+    """Seed one user's places, linked to entities or, as in Phase 1, known only from hints."""
     user = User(display_name="Busy User", country="US")
     session.add(user)
     await session.flush()
@@ -52,22 +54,27 @@ async def _seed(session: AsyncSession) -> uuid.UUID:
             type="place",
             category="restaurant" if index % 2 else "café",
             collection="Food",
-            fields=place_fields((f"Place {index}", district, f"cuisine {index % 9}")),
+            fields=place_fields(
+                (f"Place {index}", f"{district}, City of {district}", f"cuisine {index % 9}")
+            ),
             summary=f"Saved place number {index}",
             embedding=_vector(index),
             status=ItemStatus.DONE,
         )
-        session.add_all([entity, item])
-        await session.flush()
-        session.add(ItemEntity(saved_item_id=item.id, entity_id=entity.id))
+        session.add(item)
+        if resolved:
+            session.add(entity)
+            await session.flush()
+            session.add(ItemEntity(saved_item_id=item.id, entity_id=entity.id))
     await session.flush()
     return user.id
 
 
+@pytest.mark.parametrize("resolved", [True, False], ids=["entities", "area-hints"])
 async def test_a_typical_filtered_vector_search_takes_under_200_ms(
-    db_session: AsyncSession,
+    db_session: AsyncSession, resolved: bool
 ) -> None:
-    user_id = await _seed(db_session)
+    user_id = await _seed(db_session, resolved=resolved)
     query = SearchQuery(
         user_id=user_id,
         collection="Food",

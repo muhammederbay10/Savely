@@ -226,6 +226,56 @@ def test_only_an_open_value_filter_can_use_the_vocabulary(kind: FilterKind) -> N
         SearchFilter(name="diet", kind=kind, description="The diet.", vocabulary="diet")
 
 
+def test_the_place_area_filter_reads_the_mentions_area_hint() -> None:
+    assert search_filter("place", "area").mention_field == "area_hint"
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        FilterKind.VALUE,
+        FilterKind.LOCATION,
+        FilterKind.BOOLEAN,
+        FilterKind.INTEGER,
+        FilterKind.TEXT,
+    ],
+)
+def test_only_an_area_filter_can_name_a_mention_field(kind: FilterKind) -> None:
+    with pytest.raises(ContentTypeDefinitionError, match="'shelf' is not an area"):
+        SearchFilter(name="shelf", kind=kind, description="The shelf.", mention_field="shelf")
+
+
+def test_a_mention_field_must_be_a_field_of_the_types_mentions() -> None:
+    area = SearchFilter(
+        name="area", kind=FilterKind.AREA, description="Where.", mention_field="area_hint"
+    )
+
+    with pytest.raises(ContentTypeDefinitionError, match="reads 'area_hint'"):
+        make_content_type(
+            name="book",
+            extraction_schema=BookExtraction,
+            resolver="open_library",
+            search_filters=(area,),
+        )
+    with pytest.raises(ContentTypeDefinitionError, match="reads 'area_hint'"):
+        make_content_type(search_filters=(area,))
+
+
+def test_a_mention_field_of_the_types_mentions_is_accepted() -> None:
+    title = SearchFilter(
+        name="area", kind=FilterKind.AREA, description="Where.", mention_field="title"
+    )
+
+    book = make_content_type(
+        name="book",
+        extraction_schema=BookExtraction,
+        resolver="open_library",
+        search_filters=(title,),
+    )
+
+    assert book.search_filters == (title,)
+
+
 def test_type_rejects_two_filters_with_the_same_name() -> None:
     filters = (
         SearchFilter(name="time", kind=FilterKind.INTEGER, description="Minutes to cook."),

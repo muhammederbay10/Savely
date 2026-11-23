@@ -11,12 +11,14 @@ values belong to.
 
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Annotated
+from typing import Annotated, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 CATEGORY_VOCABULARY = "category"
 TAG_VOCABULARY = "tag"
+# The field of an `EntityExtraction` that lists a post's mentions.
+MENTIONS_FIELD = "entities"
 
 NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 
@@ -143,9 +145,11 @@ class FilterSource(StrEnum):
         SAVED_VALUES: What indexing stored. A `VALUE`, `INTEGER`, `BOOLEAN` or
             `TEXT` filter reads the key named after the filter: in the item's
             `fields` when the extraction schema has it as a top-level field,
-            otherwise in a linked entity's `data` or that entity's own mention.
-            An `AREA` filter reads the entities' address levels, a `LOCATION`
-            filter their coordinates.
+            otherwise per mention in `fields.entities`, where a linked
+            entity's `data` counts too. An `AREA` filter reads a linked
+            entity's address levels, or, for a mention with no linked entity,
+            the parts of the mention's `mention_field` (decision record 0017).
+            A `LOCATION` filter reads the entities' coordinates.
         COUNTRY_AVAILABILITY: Where an entity can be streamed in the asking
             user's country (`entity_availability`). Only for `VALUE` filters.
         USER_STATUS: Whether the asking user marked the item's entity as done
@@ -183,10 +187,17 @@ class SearchFilter:
             value saved in another. `None` when the values come from somewhere
             else, such as a resolver, and for every other kind.
         source: Where search finds what the filter is checked against.
+        mention_field: For an `AREA` filter, the key of a mention in
+            `fields.entities` that holds where the post said it is, e.g.
+            `area_hint`. Read only for a mention with no linked entity; a
+            linked entity's address always wins. `None` means a mention with
+            no linked entity never matches the area. Other kinds read the key
+            named after the filter, so they never set it.
 
     Raises:
         ContentTypeDefinitionError: If a filter that is not a `VALUE` names a
-            vocabulary field, or its source cannot serve its kind.
+            vocabulary field, a filter that is not an `AREA` names a mention
+            field, or its source cannot serve its kind.
     """
 
     name: str
@@ -194,12 +205,17 @@ class SearchFilter:
     description: str
     vocabulary: str | None = None
     source: FilterSource = FilterSource.SAVED_VALUES
+    mention_field: str | None = None
 
     def __post_init__(self) -> None:
-        """Check that only an open-value filter points at the vocabulary, and the source fits."""
+        """Check that the vocabulary and the mention field fit the kind, and the source fits."""
         if self.vocabulary is not None and self.kind is not FilterKind.VALUE:
             raise ContentTypeDefinitionError(
                 f"Filter '{self.name}' is not an open value, so it cannot use the vocabulary"
+            )
+        if self.mention_field is not None and self.kind is not FilterKind.AREA:
+            raise ContentTypeDefinitionError(
+                f"Filter '{self.name}' is not an area, so it cannot name a mention field"
             )
         allowed_kinds = _KINDS_OF_SOURCE.get(self.source)
         if allowed_kinds is not None and self.kind not in allowed_kinds:
@@ -224,9 +240,10 @@ class ContentType:
         search_filters: The filters the type adds to search.
 
     Raises:
-        ContentTypeDefinitionError: If two filters share a name, or the
+        ContentTypeDefinitionError: If two filters share a name, the
             resolver and the extraction schema disagree on whether the type
-            has entities.
+            has entities, or a filter's mention field is not a field of the
+            type's mentions.
     """
 
     name: str
@@ -239,6 +256,7 @@ class ContentType:
         """Check that the parts of the declaration fit together."""
         self._require_unique_filter_names()
         self._require_resolver_matches_schema()
+        self._require_mention_fields_exist()
 
     def _require_unique_filter_names(self) -> None:
         """Check that no two filters share a name.
@@ -269,3 +287,32 @@ class ContentType:
             raise ContentTypeDefinitionError(
                 f"Content type '{self.name}' extracts entities, so it needs a resolver"
             )
+
+    def _require_mention_fields_exist(self) -> None:
+        """Check that every filter's mention field is a field of the type's mentions.
+
+        Raises:
+            ContentTypeDefinitionError: If a filter names a mention field the
+                mentions do not have, or the type has no mentions.
+        """
+        mention_fields = _mention_fields(self.extraction_schema)
+        for search_filter in self.search_filters:
+            field = search_filter.mention_field
+            if field is not None and field not in mention_fields:
+                raise ContentTypeDefinitionError(
+                    f"Filter '{search_filter.name}' of content type '{self.name}' reads "
+                    f"'{field}', which its mentions do not have"
+                )
+
+
+def _mention_fields(schema: type[Extraction]) -> frozenset[str]:
+    """List the fields of a schema's mentions; empty if it has none."""
+    entities = schema.model_fields.get(MENTIONS_FIELD)
+    if entities is None:
+        return frozenset()
+    return frozenset(
+        name
+        for mention in get_args(entities.annotation)
+        if isinstance(mention, type) and issubclass(mention, EntityMention)
+        for name in mention.model_fields
+    )

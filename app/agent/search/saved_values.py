@@ -6,6 +6,10 @@ query is limited to one user's items; the shared tables (`entity`,
 `entity_availability`, `vocabulary`) are only read through that user's items,
 or hold only gated, generic wording.
 
+An area's values are the address levels of the user's linked entities and the
+parts of the area hints of their mentions with no linked entity: exactly the
+values the area filter matches (decision record 0017).
+
 Nothing here lists real-world values in code: every value comes from the data.
 """
 
@@ -14,12 +18,20 @@ from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from typing import Final
 
-from sqlalchemy import Float, TextClause, bindparam, select, text
+from sqlalchemy import Executable, Float, Select, bindparam, func, select, text, true, union_all
+from sqlalchemy.dialects.postgresql import array
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agent.search.conditions import WATCHABLE_OFFER_KINDS
+from app.agent.search.conditions import (
+    ADDRESS_LEVELS,
+    WATCHABLE_OFFER_KINDS,
+    area_hint_parts,
+    mention_is_unresolved,
+    owned_by,
+    unresolved_mention,
+)
 from app.agent.search.query import CATEGORY_SLOT, COLLECTION_SLOT, Wording
-from app.db.models import Vocabulary
+from app.db.models import Entity, ItemEntity, SavedItem, Vocabulary
 from app.db.types import Vector
 from app.types.base import FilterKind, FilterSource
 
@@ -64,18 +76,6 @@ _USER_FIELD_VALUES: Final = text(
         WHERE saved_item.user_id = :user_id AND saved_item.type = :type
     ) AS found
     WHERE found.value IS NOT NULL
-    """
-)
-
-_USER_AREAS: Final = text(
-    """
-    SELECT DISTINCT level.value FROM saved_item
-    JOIN item_entity ON item_entity.saved_item_id = saved_item.id
-    JOIN entity ON entity.id = item_entity.entity_id
-    CROSS JOIN LATERAL unnest(ARRAY[
-        entity.country, entity.region, entity.city, entity.district, entity.neighbourhood
-    ]) AS level(value)
-    WHERE saved_item.user_id = :user_id AND saved_item.type = :type AND level.value IS NOT NULL
     """
 )
 
@@ -126,7 +126,7 @@ async def saved_values(session: AsyncSession, scope: ValueScope, wording: Wordin
     return [value for value in rows.scalars() if value]
 
 
-def _values_statement(scope: ValueScope, wording: Wording) -> tuple[TextClause, dict[str, object]]:
+def _values_statement(scope: ValueScope, wording: Wording) -> tuple[Executable, dict[str, object]]:
     parameters: dict[str, object] = {"user_id": scope.user_id}
     if wording.slot == COLLECTION_SLOT:
         return _USER_COLLECTIONS, parameters
@@ -143,8 +143,47 @@ def _values_statement(scope: ValueScope, wording: Wording) -> tuple[TextClause, 
             "offer_kinds": list(WATCHABLE_OFFER_KINDS),
         }
     if search_filter.kind is FilterKind.AREA:
-        return _USER_AREAS, parameters
+        return _user_areas(scope, search_filter.mention_field), {}
     return _USER_FIELD_VALUES, {**parameters, "key": search_filter.name}
+
+
+def _user_areas(scope: ValueScope, mention_field: str | None) -> Select[tuple[str]]:
+    """List the areas of the user's items of the scope's type.
+
+    Args:
+        scope: Whose saves to read, and which type.
+        mention_field: The key of a mention that holds its area hint; `None`
+            if the type's mentions have none.
+
+    Returns:
+        The distinct, non-empty areas.
+    """
+    in_scope = (owned_by(scope.user_id), SavedItem.type == scope.type)
+    levels = func.unnest(array(ADDRESS_LEVELS)).table_valued("value").render_derived(name="level")
+    sources = [
+        select(levels.c.value)
+        .select_from(SavedItem)
+        .join(ItemEntity, ItemEntity.saved_item_id == SavedItem.id)
+        .join(Entity, Entity.id == ItemEntity.entity_id)
+        .join(levels, true())
+        .where(*in_scope)
+    ]
+    if mention_field is not None:
+        mention = unresolved_mention()
+        parts = (
+            func.unnest(area_hint_parts(mention_field))
+            .table_valued("value")
+            .render_derived(name="part")
+        )
+        sources.append(
+            select(parts.c.value)
+            .select_from(SavedItem)
+            .join(mention, true())
+            .join(parts, true())
+            .where(*in_scope, mention_is_unresolved())
+        )
+    found = union_all(*sources).subquery("found")
+    return select(found.c.value).where(found.c.value.is_not(None), found.c.value != "").distinct()
 
 
 async def vocabulary_values(session: AsyncSession, ids: Collection[uuid.UUID]) -> set[str]:

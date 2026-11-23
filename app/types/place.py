@@ -17,6 +17,7 @@ from app.types.base import (
 
 GOOGLE_PLACES_RESOLVER = "google_places"
 CUISINE_VOCABULARY = "cuisine"
+AREA_HINT_FIELD = "area_hint"
 
 
 class PlaceMention(EntityMention):
@@ -67,6 +68,7 @@ PLACE = ContentType(
                 "Where the place is, at any level: a country, region, city, district or "
                 "neighbourhood, e.g. 'Japan', 'Brooklyn' or 'Beşiktaş'."
             ),
+            mention_field=AREA_HINT_FIELD,
         ),
         SearchFilter(
             name="near",
