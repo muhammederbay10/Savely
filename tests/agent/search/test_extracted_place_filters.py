@@ -298,6 +298,38 @@ async def test_relaxing_keeps_a_hint_area_that_is_no_known_district(
     assert result.relaxed == ("filters.cuisine",)
 
 
+async def test_widening_a_linked_district_keeps_hints_of_that_district_only(
+    db_session: AsyncSession, saves: Saves
+) -> None:
+    # Kronotrop is linked in district Beşiktaş, city İstanbul, so L2 widens Beşiktaş to
+    # İstanbul for entities. A hint of Beşiktaş must still count; hints of other parts
+    # of İstanbul, or of the city itself, must not.
+    reel = await add_unresolved_post(
+        db_session, saves.user, "besiktas", ("Lokanta", "Beşiktaş", "anatolian")
+    )
+    elsewhere = await add_unresolved_post(
+        db_session, saves.user, "beyoglu", ("Meyhane", "Beyoğlu", "anatolian")
+    )
+    city = await add_unresolved_post(
+        db_session, saves.user, "istanbul", ("Kebapçı", "İstanbul", "anatolian")
+    )
+    theirs = await add_unresolved_post(
+        db_session, saves.other_user, "besiktas", ("Gizli", "Beşiktaş", "anatolian")
+    )
+
+    result = await build_retriever().search(db_session, in_area(saves, "Beşiktaş", cuisine="pizza"))
+
+    assert result.level is FallbackLevel.RELAXED
+    assert set(result.relaxed) == {"filters.area", "filters.cuisine"}
+    found = ids(result)
+    assert reel.id in found
+    assert saves.items["kronotrop"].id in found
+    assert saves.items["kimchi"].id in found
+    assert elsewhere.id not in found
+    assert city.id not in found
+    assert theirs.id not in found
+
+
 async def test_a_mention_without_a_hint_never_matches_an_area(
     db_session: AsyncSession, saves: Saves
 ) -> None:

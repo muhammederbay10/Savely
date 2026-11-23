@@ -559,8 +559,9 @@ async def _relaxed_conditions(
     """Build L2's conditions on fully indexed items: widen the area, drop secondary filters.
 
     Kept: the user, collection, type, category, platform, date and a "near"
-    point. Widened: an area that is a district or neighbourhood becomes its
-    city. Dropped: tags and every other type filter.
+    point. Widened: an area that is a district or neighbourhood of a linked
+    place becomes its city for linked places; mentions without an entity keep
+    matching the area as written. Dropped: tags and every other type filter.
     """
     conditions = _scope_conditions(plan, normalized, indexed=True)
     relaxed = [f"{TAG_SLOT_PREFIX}{index}" for index in range(len(plan.query.tags))]
@@ -571,12 +572,16 @@ async def _relaxed_conditions(
         if isinstance(value, Near):
             kept.append(near_predicates(value))
         elif typed.search_filter.kind is FilterKind.AREA:
+            area = area_predicates(str(value), typed.search_filter.mention_field)
             cities = await _cities_around(session, plan.query.user_id, str(value))
             if cities:
-                kept.append(city_predicates(cities))
+                # Only linked places are widened to their city; a hint keeps the area as
+                # written, since a hint doesn't say which of its parts is the city.
+                widened = city_predicates(cities)
+                kept.append(replace(widened, on_mention=area.on_mention))
                 relaxed.append(slot)
             else:
-                kept.append(area_predicates(str(value), typed.search_filter.mention_field))
+                kept.append(area)
         else:
             relaxed.append(slot)
     conditions.append(all_filters_hold(kept))
