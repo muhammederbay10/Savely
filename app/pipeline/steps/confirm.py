@@ -17,6 +17,7 @@ delivery is unknown would be sent twice.
 """
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -27,6 +28,7 @@ from app.agent.replies.templates import (
     ReplyWording,
     ReplyWordingUnavailableError,
     SavedItemSummary,
+    collection_confirmation,
     reply_wording,
     save_confirmation,
 )
@@ -144,12 +146,54 @@ class SaveConfirmer:
         Returns:
             Whether the confirmation was sent, skipped or failed.
         """
+        return await self._send(
+            recipient_id,
+            language,
+            last_user_message_at,
+            lambda wording: save_confirmation(
+                SavedItemSummary(category=category, collection=collection), wording
+            ),
+        )
+
+    async def confirm_collection(
+        self,
+        *,
+        recipient_id: str | None,
+        language: str | None,
+        collection: str,
+        last_user_message_at: datetime,
+    ) -> Confirmation:
+        """Tell the user which collection their item is in, when no save confirmation will.
+
+        Sent for an item whose indexing failed for good (decision record 0018).
+
+        Args:
+            recipient_id: The user's id on the item's platform.
+            language: The user's language from their profile; `None` while unknown.
+            collection: The collection the user named for the item.
+            last_user_message_at: When the user sent the share.
+
+        Returns:
+            Whether the confirmation was sent, skipped or failed.
+        """
+        return await self._send(
+            recipient_id,
+            language,
+            last_user_message_at,
+            lambda wording: collection_confirmation(collection, wording),
+        )
+
+    async def _send(
+        self,
+        recipient_id: str | None,
+        language: str | None,
+        last_user_message_at: datetime,
+        build: Callable[[ReplyWording], OutgoingMessage],
+    ) -> Confirmation:
         if recipient_id is None:
             return Confirmation(ConfirmationStatus.SKIPPED, SkipReason.NO_RECIPIENT)
         used_language, choice, wording = _wording_for(language)
-        message = save_confirmation(
-            SavedItemSummary(category=category, collection=collection), wording
-        )
+        message = build(wording)
         try:
             result = await self._messenger.send(recipient_id, message, last_user_message_at)
         except MessengerError as error:

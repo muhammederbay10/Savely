@@ -133,6 +133,23 @@ async def test_a_stuck_item_without_tries_left_is_failed(
     assert await queued_index_jobs(ingestion_redis, item_id) == 0
 
 
+async def test_a_stuck_named_item_that_is_failed_gets_one_collection_confirmation(
+    pipeline: Pipeline, job_queue: ArqJobQueue
+) -> None:
+    _, item_id = await new_item(pipeline, attempts=MAX_TRIES)
+    async with pipeline.sessions() as session, session.begin():
+        await session.execute(
+            update(SavedItem).where(SavedItem.id == item_id).values(collection="Food")
+        )
+    await age(pipeline, item_id, STALE_AFTER + timedelta(minutes=1))
+
+    first = await sweeper(pipeline, job_queue).sweep()
+    second = await sweeper(pipeline, job_queue).sweep()
+
+    assert (first.failed, second.failed) == (1, 0)
+    assert [text for _, text in pipeline.messenger.sent] == ["Saved to Food"]
+
+
 async def test_a_stuck_item_whose_payload_is_gone_is_failed(
     pipeline: Pipeline, job_queue: ArqJobQueue
 ) -> None:

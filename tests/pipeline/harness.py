@@ -15,6 +15,7 @@ from app.models.errors import ModelError
 from app.models.fakes import FakeEmbedder, FakeGenerator, FakeTranscriber
 from app.pipeline.indexer import ItemIndexer, PipelineSteps
 from app.pipeline.media.storage import LocalMediaStore
+from app.pipeline.recovery.acknowledgment import CollectionAcknowledger
 from app.pipeline.recovery.sweeper import Requeuer, StuckItemSweeper, SweepReport
 from app.pipeline.steps.classify import PostClassifier
 from app.pipeline.steps.confirm import SaveConfirmer
@@ -178,6 +179,10 @@ class Pipeline:
             stale_after_seconds=stale_after_seconds,
             max_tries=max_tries,
             batch_size=batch_size,
+            acknowledger=CollectionAcknowledger(
+                sessions or self.sessions,  # type: ignore[arg-type]
+                SaveConfirmer(self.messenger),
+            ),
         )
 
 

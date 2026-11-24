@@ -12,23 +12,33 @@ response agent runs:
 3. Otherwise the decision model answers one yes/no question about the text
    (`ROUTING_PROMPTS`): does it only name a collection for that post? Yes at
    or above `COLLECTION_HINT_MIN_PROBABILITY` makes it a collection hint.
-   Below it, an unanswered question or a failed call makes it chat: a missed
-   label costs little, a swallowed question looks broken.
+   Below it, an unanswered question, a failed call or a call that took longer
+   than `COLLECTION_HINT_DECISION_TIMEOUT_SECONDS` (provider retries included)
+   makes it chat, and that is kept: a missed label costs little, a swallowed
+   question looks broken. The timeout is at most half the chat run's
+   deadline, so the rest of the run is left to answer.
 4. Under the user's row lock again, the decision is kept in the receipt and,
    for a hint, the item gets its collection, in one go. Whether the item's
-   save confirmation had already started without it is read under the same
-   lock and kept too (`confirm_collection`), so the chat worker sends one
-   short collection confirmation only then, and on every try decides the same.
+   save confirmation will miss it is read under the same lock and kept too
+   (`confirm_collection`): the confirmation had already started, or the
+   item's indexing failed for good, so no confirmation will come. Only then
+   does the chat worker send one short collection confirmation, and on every
+   try it decides the same. An item whose indexing fails for good after the
+   label was set gets that confirmation from the indexer instead
+   (`app.pipeline.recovery.acknowledgment`).
 
 The receipt in Redis is written before the database commits. If the commit
-fails, a later try follows the receipt and sets the collection again
-(`set_collection_if_missing` changes nothing when it is already set).
+fails, the label is set again under the lock before a hint is followed, by a
+later try or by an overlapping one that finds the receipt decided
+(`set_collection_if_missing` changes nothing when it is already set), so a
+hint is never confirmed without its label.
 
 Holding the user's row lock keeps all of this from racing "delete my data",
 which takes the same lock; a user deleted meanwhile has no receipt left, and
 nothing is written. The model is never called while the lock is held.
 """
 
+import asyncio
 import logging
 import uuid
 from typing import Final
@@ -41,7 +51,7 @@ from app.ingestion.repository import is_unlabelled_item, lock_user, set_collecti
 from app.ingestion.session_state import RedisIngestionState, TextReceipt, TextRoute
 from app.models.base import Classifier, YesNoAnswer, YesNoQuestion
 from app.models.errors import ModelError
-from app.pipeline.recovery.runs import confirmation_started
+from app.pipeline.recovery.runs import save_confirmation_misses_collection
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +98,7 @@ class TextRouter:
         prompts: RoutingPrompts,
         *,
         min_probability: float,
+        decision_timeout_seconds: float,
     ) -> None:
         """Create the router.
 
@@ -97,12 +108,15 @@ class TextRouter:
             classifier: The decision model.
             prompts: The wording of the question.
             min_probability: `COLLECTION_HINT_MIN_PROBABILITY`.
+            decision_timeout_seconds: `COLLECTION_HINT_DECISION_TIMEOUT_SECONDS`:
+                how long the whole decision call may take, retries included.
         """
         self._sessions = sessions
         self._state = state
         self._classifier = classifier
         self._prompts = prompts
         self._min_probability = min_probability
+        self._decision_timeout_seconds = decision_timeout_seconds
 
     async def settle(
         self, user_id: uuid.UUID, message: ChatMessage, receipt: TextReceipt
@@ -137,10 +151,19 @@ class TextRouter:
         ):
             self._log(user_id, TextRoute.CHAT, "item_labelled", probability=None)
             return False
+        deadline = asyncio.timeout(self._decision_timeout_seconds)
         try:
-            probability = await collection_name_probability(
-                self._classifier, self._prompts, message.text
-            )
+            async with deadline:
+                probability = await collection_name_probability(
+                    self._classifier, self._prompts, message.text
+                )
+        except TimeoutError:
+            if not deadline.expired():
+                # The chat run's own deadline: the job tries again.
+                raise
+            logger.warning("text_route_decision_timed_out", extra={"user_id": str(user_id)})
+            self._log(user_id, TextRoute.CHAT, "decision_timed_out", probability=None)
+            return False
         except ModelError as error:
             logger.warning(
                 "text_route_decision_failed",
@@ -166,9 +189,12 @@ class TextRouter:
     ) -> TextReceipt | None:
         async with self._sessions.begin() as session:
             current = await self._locked_receipt(session, user_id, message)
-            if current is None or current.route is not TextRoute.UNDECIDED:
-                # Gone, or an overlapping try decided first: its decision stands.
+            if current is None or current.route is TextRoute.CHAT:
                 return current
+            if current.route is TextRoute.COLLECTION_HINT:
+                # An overlapping try decided first: its decision stands, but its
+                # database write may have rolled back.
+                return await self._label_again(session, user_id, message, current)
             decided = current.model_copy(update={"route": TextRoute.CHAT})
             if names_collection:
                 hint = await self._label(session, user_id, message, current)
@@ -179,18 +205,30 @@ class TextRouter:
             return decided
 
     async def _apply_again(self, user_id: uuid.UUID, message: ChatMessage) -> TextReceipt | None:
-        """Set a decided hint's collection again, in case the try that decided it didn't commit."""
         async with self._sessions.begin() as session:
             current = await self._locked_receipt(session, user_id, message)
             if current is None or current.route is not TextRoute.COLLECTION_HINT:
                 return current
-            relabelled = await self._label(session, user_id, message, current)
-            if relabelled is None:
-                return current
-            await self._state.save_text_receipt(
-                user_id, message.platform, message.message_id, relabelled
-            )
-            return relabelled
+            return await self._label_again(session, user_id, message, current)
+
+    async def _label_again(
+        self,
+        session: AsyncSession,
+        user_id: uuid.UUID,
+        message: ChatMessage,
+        receipt: TextReceipt,
+    ) -> TextReceipt:
+        """Set a decided hint's collection again, in case the try that decided it didn't commit.
+
+        Runs under the user's row lock, and commits before the hint is followed.
+        """
+        relabelled = await self._label(session, user_id, message, receipt)
+        if relabelled is None:
+            return receipt
+        await self._state.save_text_receipt(
+            user_id, message.platform, message.message_id, relabelled
+        )
+        return relabelled
 
     async def _label(
         self,
@@ -206,10 +244,11 @@ class TextRouter:
             session, user_id, receipt.saved_item_id, message.text
         ):
             return None
-        # Under the row lock the indexer also takes to start the save confirmation.
-        started = await confirmation_started(session, receipt.saved_item_id)
+        # Under the row lock the indexer also takes to start the save
+        # confirmation and to fail the item.
+        missed = await save_confirmation_misses_collection(session, receipt.saved_item_id)
         return receipt.model_copy(
-            update={"route": TextRoute.COLLECTION_HINT, "confirm_collection": started}
+            update={"route": TextRoute.COLLECTION_HINT, "confirm_collection": missed}
         )
 
     async def _locked_receipt(

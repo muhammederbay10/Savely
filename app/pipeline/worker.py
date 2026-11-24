@@ -65,6 +65,7 @@ from app.pipeline.media.storage import LocalMediaStore
 from app.pipeline.media.tools import FfmpegMediaTools
 from app.pipeline.payloads import CapturePayloads
 from app.pipeline.prompts import PIPELINE_PROMPTS
+from app.pipeline.recovery.acknowledgment import CollectionAcknowledger
 from app.pipeline.recovery.sweeper import StuckItemSweeper
 from app.pipeline.steps.classify import PostClassifier
 from app.pipeline.steps.confirm import SaveConfirmer
@@ -193,6 +194,8 @@ async def start_worker(ctx: JobContext) -> None:
         phone_min_digits=pipeline_settings.vocab_phone_min_digits,
         match_candidates=pipeline_settings.vocab_match_candidates,
     )
+    # Instagram is the only platform with a messenger so far (ARCHITECTURE §3.1).
+    confirmer = SaveConfirmer(InstagramMessenger(messenger_http, get_messenger_settings()))
     steps = PipelineSteps(
         fetcher=MediaFetcher(
             media_http,
@@ -227,8 +230,7 @@ async def start_worker(ctx: JobContext) -> None:
             sessions, models.classifier, models.embedder, PIPELINE_PROMPTS, rules
         ),
         embedder=ItemEmbedder(models.embedder),
-        # Instagram is the only platform with a messenger so far (ARCHITECTURE §3.1).
-        confirmer=SaveConfirmer(InstagramMessenger(messenger_http, get_messenger_settings())),
+        confirmer=confirmer,
         store=store,
     )
     ctx[_RESOURCES] = WorkerResources(
@@ -250,6 +252,7 @@ async def start_worker(ctx: JobContext) -> None:
             stale_after_seconds=pipeline_settings.indexing_stale_after_seconds,
             max_tries=pipeline_settings.indexing_max_tries,
             batch_size=pipeline_settings.indexing_sweep_batch_size,
+            acknowledger=CollectionAcknowledger(sessions, confirmer),
         ),
         retry_delay_seconds=pipeline_settings.indexing_retry_delay_seconds,
         close=partial(_close, engine, (model_http, media_http, messenger_http)),

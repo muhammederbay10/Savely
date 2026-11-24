@@ -84,6 +84,7 @@ def chat_settings(**overrides: object) -> ChatSettings:
         "chat_run_deadline_seconds": 60.0,
         "chat_job_timeout_seconds": 120.0,
         "collection_hint_min_probability": 0.7,
+        "collection_hint_decision_timeout_seconds": 10.0,
     }
     return ChatSettings(_env_file=None, **{**values, **overrides})  # type: ignore[arg-type]
 

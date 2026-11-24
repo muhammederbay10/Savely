@@ -17,7 +17,7 @@ from typing import Final
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import EnrichmentRun, PlatformAccount, SavedItem, User
+from app.db.models import EnrichmentRun, ItemStatus, PlatformAccount, SavedItem, User
 
 
 class Step(StrEnum):
@@ -93,6 +93,26 @@ async def finished_steps(session: AsyncSession, saved_item_id: uuid.UUID) -> dic
         )
     )
     return {Step(row.step): dict(row.output or {}) for row in rows}
+
+
+async def save_confirmation_misses_collection(
+    session: AsyncSession, saved_item_id: uuid.UUID
+) -> bool:
+    """Tell whether a collection set now would be in no save confirmation of the item.
+
+    That is so when the confirmation started to be sent (`confirmation_started`)
+    or the item's indexing failed for good, so none will be sent. Call it under
+    the owner's row lock, which the indexer and the sweeper also hold for both.
+
+    Args:
+        session: The session to work in.
+        saved_item_id: The item.
+
+    Returns:
+        Whether the caller must confirm the collection itself.
+    """
+    status = await session.scalar(select(SavedItem.status).where(SavedItem.id == saved_item_id))
+    return status == ItemStatus.FAILED or await confirmation_started(session, saved_item_id)
 
 
 async def confirmation_started(session: AsyncSession, saved_item_id: uuid.UUID) -> bool:

@@ -7,21 +7,33 @@ scripted and Meta's Send API is a recording mock. These tests need Postgres
 synthetic.
 """
 
+import asyncio
 import uuid
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from datetime import timedelta
 
 import pytest
 from sqlalchemy import select, update
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.adapters.base import CaptureEvent
 from app.agent.chat import ChatOutcome, RetryLaterError
 from app.agent.replies.templates import reply_wording
 from app.db.deletion import UserDataEraser
-from app.db.models import EnrichmentRun, SavedItem, User
+from app.db.models import EnrichmentRun, ItemStatus, SavedItem, User
 from app.ingestion.service import IngestionOutcome
 from app.ingestion.session_state import TextReceipt, TextRoute
 from app.ingestion.text_routing import COLLECTION_NAME_QUESTION_KEY
-from app.models.base import Answer, Unanswered, YesNoAnswer
+from app.models.base import (
+    Answer,
+    ContentPart,
+    DecisionResult,
+    Question,
+    Unanswered,
+    YesNoAnswer,
+)
 from app.models.errors import ModelUnavailableError
 from app.models.fakes import FakeClassifier
 from app.pipeline.recovery.runs import RunStatus, Step
@@ -45,6 +57,10 @@ COLLECTION = "Filmler"
 NAMES_IT = YesNoAnswer(probability_yes=0.97, confidence=None)
 DOES_NOT = YesNoAnswer(probability_yes=0.03, confidence=None)
 UNSURE = YesNoAnswer(probability_yes=HINT_MIN_PROBABILITY - 0.01, confidence=None)
+# A stalled decision gives up long before the chat run's deadline, which leaves time to answer.
+STALL_TIMEOUT_SECONDS = 0.1
+STALL_RUN_DEADLINE_SECONDS = 1.0
+ATTEMPTS = 3
 MODEL_DOWN = ModelUnavailableError("synthetic outage", operation="decide", model="fake/decision")
 
 
@@ -355,3 +371,177 @@ async def test_a_text_of_a_user_deleted_before_its_job_asks_no_model_and_labels_
     assert outcome is ChatOutcome.NO_MESSAGE
     assert model.calls == []
     assert chat.sent_texts() == []
+
+
+# --- Round 1 review: a stalled decision, an adopted hint whose write rolled back, failures --
+
+
+class StalledClassifier(FakeClassifier):
+    """A decision model that never answers, like a provider stuck in its own retries."""
+
+    async def decide(
+        self, state: Sequence[ContentPart], questions: Sequence[Question]
+    ) -> DecisionResult:
+        self.calls.append((tuple(state), tuple(questions)))
+        await asyncio.Event().wait()
+        raise AssertionError("a stalled decision never returns")
+
+
+class PausedClassifier(FakeClassifier):
+    """Answers that the text names a collection, but only once the test lets it."""
+
+    def __init__(self) -> None:
+        super().__init__({COLLECTION_NAME_QUESTION_KEY: NAMES_IT})
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def decide(
+        self, state: Sequence[ContentPart], questions: Sequence[Question]
+    ) -> DecisionResult:
+        self.entered.set()
+        await self.release.wait()
+        return await super().decide(state, questions)
+
+
+class SessionsWhoseCommitFails:
+    """Opens real sessions, but every transaction from `begin()` rolls back and fails."""
+
+    def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
+        self._sessions = sessions
+
+    def __call__(self) -> AsyncSession:
+        return self._sessions()
+
+    @asynccontextmanager
+    async def begin(self) -> AsyncIterator[AsyncSession]:
+        async with self._sessions() as session:
+            await session.begin()
+            yield session
+            await session.rollback()
+            raise OperationalError("COMMIT", {}, Exception("synthetic lost commit"))
+
+
+async def run_every_attempt(
+    chat: ChatUnderTest, user_id: uuid.UUID, receipt: uuid.UUID, attempts: int
+) -> list[ChatOutcome | str]:
+    """Run a job's attempts the way the worker does, until one returns."""
+    outcomes: list[ChatOutcome | str] = []
+    for attempt in range(1, attempts + 1):
+        try:
+            outcomes.append(
+                await chat.responder.respond(user_id, receipt, last_try=attempt == attempts)
+            )
+        except RetryLaterError:
+            outcomes.append("retry")
+            continue
+        break
+    return outcomes
+
+
+async def test_a_stalled_decision_falls_back_to_chat_and_the_question_is_answered(
+    chat_stores: ChatStores,
+) -> None:
+    user_id = await chat_stores.new_user(SENDER_ID)
+    model = StalledClassifier()
+    chat = build_chat(
+        chat_stores,
+        [final_answer("en", "Here you go.")],
+        routing_model=model,
+        routing_timeout_seconds=STALL_TIMEOUT_SECONDS,
+        run_deadline_seconds=STALL_RUN_DEADLINE_SECONDS,
+    )
+    share, receipt = await text_right_after(chat_stores, user_id, QUESTION)
+
+    outcomes = await run_every_attempt(chat, user_id, receipt, ATTEMPTS)
+
+    # The first attempt answers: the route is kept as chat, never asked again.
+    assert outcomes == [ChatOutcome.ANSWERED]
+    assert (await receipt_for(chat_stores, user_id, receipt)).route is TextRoute.CHAT
+    assert len(chat.agent.generator.requests) == 1
+    assert chat.sent_texts() == ["Here you go."]
+    assert len(model.calls) == 1
+    assert (await item_of(chat_stores, share)).collection is None
+
+
+async def test_an_adopted_hint_whose_write_rolled_back_is_labelled_before_it_is_confirmed(
+    chat_stores: ChatStores,
+) -> None:
+    user_id = await chat_stores.new_user(SENDER_ID)
+    paused = PausedClassifier()
+    first = build_chat(chat_stores, [], routing_model=paused)
+    second = build_chat(
+        chat_stores,
+        [],
+        routing_model=routing_model(NAMES_IT),
+        routing_sessions=SessionsWhoseCommitFails(chat_stores.sessions),  # type: ignore[arg-type]
+    )
+    share, receipt = await text_right_after(chat_stores, user_id, COLLECTION)
+    await start_save_confirmation(chat_stores, await item_of(chat_stores, share))
+
+    # Attempt A waits in the decision model; attempt B decides, keeps the receipt,
+    # and its database transaction rolls back.
+    attempt_a = asyncio.create_task(first.responder.respond(user_id, receipt, last_try=False))
+    await paused.entered.wait()
+    with pytest.raises(RetryLaterError):
+        await second.responder.respond(user_id, receipt, last_try=False)
+    assert (await receipt_for(chat_stores, user_id, receipt)).route is TextRoute.COLLECTION_HINT
+    assert (await item_of(chat_stores, share)).collection is None
+    paused.release.set()
+    outcome = await attempt_a
+
+    # A adopts B's hint, repairs the label under the user lock, then confirms it once.
+    assert outcome is ChatOutcome.COLLECTION_CONFIRMED
+    assert (await item_of(chat_stores, share)).collection == COLLECTION
+    assert first.sent_texts() == ["Saved to Filmler"]
+    later = await first.responder.respond(user_id, receipt, last_try=True)
+    assert later is ChatOutcome.ALREADY_SENT
+    assert (await item_of(chat_stores, share)).collection == COLLECTION
+    assert first.sent_texts() == ["Saved to Filmler"]
+    assert second.sent_texts() == []
+
+
+async def fail_indexing(stores: ChatStores, item: SavedItem) -> None:
+    """What the indexer or the sweeper writes when an item's indexing fails for good."""
+    async with stores.sessions.begin() as session:
+        await session.execute(
+            update(SavedItem).where(SavedItem.id == item.id).values(status=ItemStatus.FAILED)
+        )
+
+
+async def test_a_name_for_an_item_whose_indexing_failed_is_confirmed_once(
+    chat_stores: ChatStores,
+) -> None:
+    user_id = await chat_stores.new_user(SENDER_ID)
+    await set_language(chat_stores, user_id, "tr")
+    chat = answering(chat_stores, routing_model(NAMES_IT))
+    share, receipt = await text_right_after(chat_stores, user_id, COLLECTION)
+    # Failed before the label: no save confirmation will ever name it.
+    await fail_indexing(chat_stores, await item_of(chat_stores, share))
+
+    first = await chat.responder.respond(user_id, receipt, last_try=False)
+    again = await chat.responder.respond(user_id, receipt, last_try=True)
+
+    assert (first, again) == (ChatOutcome.COLLECTION_CONFIRMED, ChatOutcome.ALREADY_SENT)
+    assert chat.sent_texts() == ["Filmler koleksiyonuna kaydedildi"]
+    assert (await item_of(chat_stores, share)).collection == COLLECTION
+
+
+async def test_a_label_whose_indexing_fails_afterwards_is_left_to_the_indexer_on_every_retry(
+    chat_stores: ChatStores,
+) -> None:
+    user_id = await chat_stores.new_user(SENDER_ID)
+    model = routing_model(NAMES_IT)
+    chat = answering(chat_stores, model)
+    share, receipt = await text_right_after(chat_stores, user_id, COLLECTION)
+    first = await chat.responder.respond(user_id, receipt, last_try=False)
+    item = await item_of(chat_stores, share)
+    # Indexing then fails for good: the indexer claims and sends the collection
+    # confirmation (tests/pipeline/test_indexer.py).
+    await fail_indexing(chat_stores, item)
+    await start_save_confirmation(chat_stores, item)
+
+    again = await chat.responder.respond(user_id, receipt, last_try=True)
+
+    assert (first, again) == (ChatOutcome.COLLECTION_HINT, ChatOutcome.COLLECTION_HINT)
+    assert chat.sent_texts() == []
+    assert len(model.calls) == 1

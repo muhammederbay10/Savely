@@ -261,6 +261,7 @@ async def start_worker(ctx: JobContext) -> None:
                 models.classifier,
                 ROUTING_PROMPTS,
                 min_probability=chat_settings.collection_hint_min_probability,
+                decision_timeout_seconds=chat_settings.collection_hint_decision_timeout_seconds,
             ),
             memory=session_memory(redis, chat_settings),
             conversations=ConversationStore(sessions),

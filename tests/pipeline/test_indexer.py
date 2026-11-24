@@ -23,7 +23,7 @@ from app.pipeline.media.tools import MediaProbe
 from app.pipeline.recovery.runs import Step, confirmation_started
 from app.pipeline.steps.classify import NONE_OF_THESE
 from app.types.registry import UnknownContentTypeError
-from tests.pipeline.harness import Pipeline, add_item, add_user, load
+from tests.pipeline.harness import MAX_TRIES, Pipeline, add_item, add_user, load
 from tests.pipeline.support import (
     ESCALATION_MODEL,
     FALLBACK_STT_MODEL,
@@ -527,3 +527,69 @@ async def test_an_item_whose_tries_are_spent_is_failed_without_any_step(
     assert pipeline.classifier.calls == []
     assert pipeline.primary_stt.calls == []
     assert pipeline.text_model.requests == []
+
+
+# --- A named collection is confirmed even when indexing fails for good (SAV-39) ---------
+
+
+async def test_a_named_item_whose_indexing_fails_gets_one_collection_confirmation(
+    pipeline: Pipeline,
+) -> None:
+    user_id = await add_user(pipeline.sessions, language="tr")
+    item_id = await add_item(
+        pipeline.sessions, pipeline, capture_event(user_id, media_url=None), collection="Filmler"
+    )
+
+    outcome = await pipeline.indexer().index(user_id, item_id)
+    again = await pipeline.indexer().index(user_id, item_id)
+
+    assert (outcome, again) == (IndexOutcome.FAILED, IndexOutcome.NOT_PENDING)
+    assert [text for _, text in pipeline.messenger.sent] == ["Filmler koleksiyonuna kaydedildi"]
+    confirm = (await runs_of(pipeline, item_id))["confirm"]
+    assert confirm.status == "done"
+    assert confirm.output["after_failure"] is True
+
+
+async def test_a_named_item_whose_tries_are_spent_gets_one_collection_confirmation(
+    pipeline: Pipeline,
+) -> None:
+    user_id = await add_user(pipeline.sessions)
+    item_id = await add_item(pipeline.sessions, pipeline, capture_event(user_id), collection="Food")
+    async with pipeline.sessions() as session, session.begin():
+        await session.execute(
+            update(SavedItem).where(SavedItem.id == item_id).values(indexing_attempts=MAX_TRIES)
+        )
+
+    outcome = await pipeline.indexer(max_tries=MAX_TRIES).index(user_id, item_id)
+
+    assert outcome is IndexOutcome.FAILED
+    assert [text for _, text in pipeline.messenger.sent] == ["Saved to Food"]
+
+
+async def test_an_item_without_a_collection_that_fails_sends_nothing(pipeline: Pipeline) -> None:
+    user_id = await add_user(pipeline.sessions)
+    item_id = await add_item(pipeline.sessions, pipeline, capture_event(user_id, media_url=None))
+
+    assert await pipeline.indexer().index(user_id, item_id) is IndexOutcome.FAILED
+    assert pipeline.messenger.sent == []
+    assert "confirm" not in await runs_of(pipeline, item_id)
+
+
+async def test_a_named_item_that_recovers_after_a_retry_gets_only_its_save_confirmation(
+    pipeline: Pipeline,
+) -> None:
+    failure = ModelUnavailableError("synthetic outage", operation="transcribe", model="fake/gpt")
+    pipeline.script(
+        transcripts=[transcript(""), transcript("")],
+        fallback_transcripts=[failure, transcript("")],
+        extractions=[structured_reply(open_extraction())],
+    )
+    user_id = await add_user(pipeline.sessions)
+    item_id = await add_item(pipeline.sessions, pipeline, capture_event(user_id), collection="Food")
+
+    with pytest.raises(RetryLaterError):
+        await pipeline.indexer().index(user_id, item_id)
+    assert pipeline.messenger.sent == []
+    await pipeline.indexer().index(user_id, item_id)
+
+    assert [text for _, text in pipeline.messenger.sent] == ["Saved as car review · in Food"]

@@ -16,6 +16,7 @@ CHAT_ENVIRONMENT = {
     "CHAT_RUN_DEADLINE_SECONDS": "60",
     "CHAT_JOB_TIMEOUT_SECONDS": "180",
     "COLLECTION_HINT_MIN_PROBABILITY": "0.7",
+    "COLLECTION_HINT_DECISION_TIMEOUT_SECONDS": "10",
 }
 
 
@@ -43,6 +44,7 @@ def test_chat_settings_are_read_from_environment_variables(
     assert settings.chat_run_deadline_seconds == 60
     assert settings.chat_job_timeout_seconds == 180
     assert settings.collection_hint_min_probability == 0.7
+    assert settings.collection_hint_decision_timeout_seconds == 10
 
 
 @pytest.mark.parametrize("missing_variable", sorted(CHAT_ENVIRONMENT))
@@ -71,6 +73,9 @@ def test_missing_chat_variable_fails_at_load(
         ("COLLECTION_HINT_MIN_PROBABILITY", "0"),
         ("COLLECTION_HINT_MIN_PROBABILITY", "1.5"),
         ("COLLECTION_HINT_MIN_PROBABILITY", "nan"),
+        ("COLLECTION_HINT_DECISION_TIMEOUT_SECONDS", "0"),
+        # Less than half of the 60-second run would be left to answer.
+        ("COLLECTION_HINT_DECISION_TIMEOUT_SECONDS", "31"),
     ],
 )
 def test_unusable_chat_setting_is_rejected(

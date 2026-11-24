@@ -42,6 +42,11 @@ class ChatSettings(BaseSettings):
             before the text is filed as the item's collection instead of
             answered (`COLLECTION_HINT_MIN_PROBABILITY`, from 0 to 1; decision
             record 0018). Below it, the text goes to the response agent.
+        collection_hint_decision_timeout_seconds: How long that decision may
+            take, the provider's retries included, before the text is answered
+            as chat (`COLLECTION_HINT_DECISION_TIMEOUT_SECONDS`). At most half
+            of `chat_run_deadline_seconds`, so at least half of the run is
+            left to answer.
     """
 
     model_config = SettingsConfigDict(
@@ -58,12 +63,22 @@ class ChatSettings(BaseSettings):
     chat_run_deadline_seconds: float = Field(gt=0, allow_inf_nan=False)
     chat_job_timeout_seconds: float = Field(gt=0, allow_inf_nan=False)
     collection_hint_min_probability: float = Field(gt=0, le=1, allow_inf_nan=False)
+    collection_hint_decision_timeout_seconds: float = Field(gt=0, allow_inf_nan=False)
 
     @model_validator(mode="after")
     def _job_timeout_leaves_time_to_send(self) -> Self:
         if self.chat_job_timeout_seconds <= self.chat_run_deadline_seconds:
             raise ValueError(
                 "chat_job_timeout_seconds must be longer than chat_run_deadline_seconds"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _routing_leaves_time_to_answer(self) -> Self:
+        if self.collection_hint_decision_timeout_seconds * 2 > self.chat_run_deadline_seconds:
+            raise ValueError(
+                "collection_hint_decision_timeout_seconds must be at most half of "
+                "chat_run_deadline_seconds"
             )
         return self
 

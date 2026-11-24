@@ -293,7 +293,7 @@ Every saved item is understood once, when it is saved (`docs/ARCHITECTURE.md` §
 5. **Normalize:** open values (category, tags, cuisine, subject…) go through the shared vocabulary: exact hit, privacy gate, then match-or-new (§3.4).
 6. **Embed** the summary and transcript, mark the item `done`, and **confirm** by DM how it was saved, in the user's language, or in English while it isn't known.
 
-Each step's result is kept in `enrichment_run`, so a job that runs again continues where it stopped. A run that can't read its payload or item, or that passes `INDEXING_RUN_DEADLINE_SECONDS`, runs again too, and an ffmpeg or ffprobe run it was waiting for is stopped and reaped first. That deadline starts before the payload is read, so a slow start (for example, the user's row locked by "delete my data") uses the same budget as the steps. An item gets `INDEXING_MAX_TRIES` runs in all, a hard cap counted on the item across requeues and checked before each run starts; the last marks it `failed` as well as it can. Whatever a job couldn't write, the **stuck-item sweeper** repairs: an arq cron in the worker that, every `INDEXING_SWEEP_INTERVAL_SECONDS`, finds items still `pending` or `enriching` that no job has worked on for `INDEXING_STALE_AFTER_SECONDS`, and queues each again (tries left, payload still there) or marks it `failed`. It reads Postgres only, takes each owner's row lock with `SKIP LOCKED`, and is safe with several workers. The worker reads only the indexing queue; chat jobs wait in theirs. Logs hold, for each item, its type, whether it was escalated, and the cost of its model calls.
+Each step's result is kept in `enrichment_run`, so a job that runs again continues where it stopped. A run that can't read its payload or item, or that passes `INDEXING_RUN_DEADLINE_SECONDS`, runs again too, and an ffmpeg or ffprobe run it was waiting for is stopped and reaped first. That deadline starts before the payload is read, so a slow start (for example, the user's row locked by "delete my data") uses the same budget as the steps. An item gets `INDEXING_MAX_TRIES` runs in all, a hard cap counted on the item across requeues and checked before each run starts; the last marks it `failed` as well as it can. Whatever a job couldn't write, the **stuck-item sweeper** repairs: an arq cron in the worker that, every `INDEXING_SWEEP_INTERVAL_SECONDS`, finds items still `pending` or `enriching` that no job has worked on for `INDEXING_STALE_AFTER_SECONDS`, and queues each again (tries left, payload still there) or marks it `failed`. An item marked `failed` that has a collection the user named gets one "Saved to …" message, from the indexer or the sweeper, whichever failed it (see [Collection names after a share](#collection-names-after-a-share)). It reads Postgres only, takes each owner's row lock with `SKIP LOCKED`, and is safe with several workers. The worker reads only the indexing queue; chat jobs wait in theirs. Logs hold, for each item, its type, whether it was escalated, and the cost of its model calls.
 
 Run the worker on your machine (it reads `.env`, and needs ffmpeg, Postgres and Redis):
 
@@ -472,7 +472,7 @@ Like the response agent check, it is opt-in, never runs in CI (it is skipped whe
 ```bash
 git switch --detach <SAV-39 head SHA>   # switch back to your branch afterwards
 docker compose up --detach --wait db
-set -a; source .env; set +a      # needs COLLECTION_HINT_MIN_PROBABILITY and the DECISION_* settings
+set -a; source .env; set +a      # needs the COLLECTION_HINT_* and DECISION_* settings
 LIVE_MODEL_TESTS=1 TEST_DATABASE_ADMIN_URL=postgresql+asyncpg://savely:change-me@localhost:5432/postgres \
   pytest tests/live/test_response_agent_live.py tests/live/test_collection_routing_live.py \
   -v --log-cli-level=INFO
@@ -722,9 +722,10 @@ Every step can be repeated without doubling anything. If a store stays down, the
 | `CHAT_RETRY_DELAY_SECONDS` | The wait before a failed job runs again, times the try's number; also between attempts to store |
 | `CHAT_RUN_DEADLINE_SECONDS` | How long one try may take to prepare an answer; sending is not cut off |
 | `CHAT_JOB_TIMEOUT_SECONDS` | arq's own limit on one try; longer than the run deadline, only a backstop |
+| `COLLECTION_HINT_DECISION_TIMEOUT_SECONDS` | How long that decision may take, the decision model's retries included, before the text is answered as chat. At most half of `CHAT_RUN_DEADLINE_SECONDS`; `10` in `.env.example`. **New in SAV-39: add it to your `.env`** |
 | `COLLECTION_HINT_MIN_PROBABILITY` | How sure the decision model must be, above 0 and at most 1, that a text right after a share names its collection; below it the text is answered. `0.7` in `.env.example`, to be tuned on the [live routing check](#live-routing-check). **New in SAV-39: add it to your `.env`, or the chat worker won't start** |
 
-They are read through `ChatSettings` in [`app/config/chat.py`](../app/config/chat.py), with `get_chat_settings()`. The log lines (`text_route_decided`, `text_route_decision_failed`, `collection_confirmation_failed`, `chat_answer_retry`, `chat_answer_failed`, `chat_answer_send_failed`, `chat_exchange_store_failed`, `chat_exchange_not_stored`, `user_profile_updated`) hold error class names and field names only, never a message, a place or an id.
+They are read through `ChatSettings` in [`app/config/chat.py`](../app/config/chat.py), with `get_chat_settings()`. The log lines (`text_route_decided`, `text_route_decision_failed`, `text_route_decision_timed_out`, `collection_confirmation_failed`, `chat_answer_retry`, `chat_answer_failed`, `chat_answer_send_failed`, `chat_exchange_store_failed`, `chat_exchange_not_stored`, `user_profile_updated`) hold error class names and field names only, never a message, a place or an id.
 
 ### Collection names after a share
 
@@ -734,10 +735,12 @@ A user may name a collection right after sharing a post ("Food", "for my Movies 
 |---|---|---|
 | No share within the window before the text, or its item already has a collection | Chat: answered | None |
 | The decision model's yes is at or above `COLLECTION_HINT_MIN_PROBABILITY` | Collection: stored as the item's `collection`, exactly as written; not answered | One yes/no question (`ROUTING_PROMPTS` in [`app/ingestion/prompts.py`](../app/ingestion/prompts.py)) |
-| Below the threshold, unanswered, or the call failed | Chat: answered | One, or a failed one |
+| Below the threshold, unanswered, the call failed, or it took longer than `COLLECTION_HINT_DECISION_TIMEOUT_SECONDS` | Chat: answered, in the same try | One, or a failed or stopped one |
 
-- **Once:** the decision is written to the text's receipt under the user's row lock, together with the collection. A retried job, an overlapping one or a repeated webhook follows the receipt and never asks again.
+- **Once:** the decision is written to the text's receipt under the user's row lock, together with the collection. A retried job, an overlapping one or a repeated webhook follows the receipt and never asks again; for a hint it sets the collection again first, in case the write that decided it rolled back.
+- **Time to answer:** the decision gets at most `COLLECTION_HINT_DECISION_TIMEOUT_SECONDS`, the provider's retries included, and at most half of `CHAT_RUN_DEADLINE_SECONDS`. A stalled decision model makes the text chat, kept in the receipt, and the response agent answers it in the rest of the run.
 - **Confirmation:** the indexer reads the item's collection and marks its save confirmation `started` in `enrichment_run` under the same lock, then sends. A collection set before that is in the save confirmation ("Saved as café · in Food"). One set after it gets one short message from the chat worker ("Saved to Food", "Food koleksiyonuna kaydedildi"), in the user's language (English while unknown), sent once: a later try finds the reply mark and sends nothing.
+- **Failed indexing:** an item whose indexing failed for good gets no save confirmation. If it failed before the label, the chat worker sends "Saved to Food". If the label came first, whatever marks the item `failed` (the indexer's last try, an item whose tries are spent, or the stuck-item sweeper) marks the confirm step `started` in the same transaction and sends it after the commit (`collection_acknowledged_after_failure`). Both decide under the user's row lock from the same mark, so the user gets it once. A retried failure isn't final: if indexing recovers, the save confirmation names the collection.
 - **Logs:** `text_route_decided` has the route, the reason (`above_threshold`, `below_threshold`, `unanswered`, `decision_failed`, `item_labelled`), the probability and the prompts version, never the text.
 
 ## Project layout

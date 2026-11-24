@@ -24,7 +24,9 @@ It runs as an arq cron in the indexing worker. Each sweep:
    its payload still in Redis is queued again as `index_saved_item`, with its
    usual job id: arq refuses a duplicate of a job that is still queued or
    running, a finished job's kept result is dropped first, and the run resumes
-   after the finished steps. Any other stuck item is marked `failed`.
+   after the finished steps. Any other stuck item is marked `failed`; if it
+   has a collection the user named, it gets one collection confirmation after
+   the commit (`app.pipeline.recovery.acknowledgment`, decision record 0018).
 
 Deleted users and items are gone from Postgres, so they are never swept.
 """
@@ -42,6 +44,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.db.models import ItemStatus, SavedItem, User
 from app.ingestion.jobs import INDEX_SAVED_ITEM_JOB, JobArguments, index_job_id
 from app.pipeline.payloads import CaptureSource
+from app.pipeline.recovery.acknowledgment import (
+    CollectionAcknowledger,
+    CollectionAcknowledgment,
+    claim_collection_acknowledgment,
+)
 from app.pipeline.recovery.runs import mark_worked_on
 
 logger = logging.getLogger(__name__)
@@ -111,6 +118,7 @@ class StuckItemSweeper:
         stale_after_seconds: `INDEXING_STALE_AFTER_SECONDS`.
         max_tries: `INDEXING_MAX_TRIES`, the runs an item gets in all.
         batch_size: `INDEXING_SWEEP_BATCH_SIZE`, the most items one sweep handles.
+        acknowledger: Confirms the collection of an item it marks `failed`.
     """
 
     sessions: async_sessionmaker[AsyncSession]
@@ -119,6 +127,7 @@ class StuckItemSweeper:
     stale_after_seconds: float
     max_tries: int
     batch_size: int
+    acknowledger: CollectionAcknowledger
 
     async def sweep(self) -> SweepReport:
         """Handle the stuck items found now, oldest first.
@@ -179,6 +188,14 @@ class StuckItemSweeper:
             ]
 
     async def _handle(self, candidate: _Candidate, report: SweepReport) -> _Handled:
+        handled, acknowledgment = await self._repair(candidate, report)
+        if acknowledgment is not None:
+            await self.acknowledger.send(acknowledgment)
+        return handled
+
+    async def _repair(
+        self, candidate: _Candidate, report: SweepReport
+    ) -> tuple[_Handled, CollectionAcknowledgment | None]:
         async with self.sessions() as session, session.begin():
             owner = await session.execute(
                 select(User.id)
@@ -187,7 +204,7 @@ class StuckItemSweeper:
             )
             if owner.scalar_one_or_none() is None:
                 report.skipped += 1
-                return _Handled.OWNER_LOCKED
+                return _Handled.OWNER_LOCKED, None
             item = (
                 await session.execute(
                     select(SavedItem).where(SavedItem.id == candidate.item_id, self._is_stuck())
@@ -195,7 +212,7 @@ class StuckItemSweeper:
             ).scalar_one_or_none()
             if item is None:
                 report.skipped += 1
-                return _Handled.NOT_STUCK
+                return _Handled.NOT_STUCK, None
             if item.indexing_attempts < self.max_tries and await self._has_payload(candidate):
                 await self.job_queue.requeue(
                     INDEX_SAVED_ITEM_JOB,
@@ -205,14 +222,15 @@ class StuckItemSweeper:
                 await mark_worked_on(session, candidate.item_id)
                 report.requeued += 1
                 logger.info("stuck_item_requeued", extra={"saved_item_id": str(item.id)})
-                return _Handled.REPAIRED
+                return _Handled.REPAIRED, None
             item.status = ItemStatus.FAILED
+            acknowledgment = await claim_collection_acknowledgment(session, item)
             report.failed += 1
             logger.warning(
                 "stuck_item_failed",
                 extra={"saved_item_id": str(item.id), "attempts": item.indexing_attempts},
             )
-            return _Handled.REPAIRED
+            return _Handled.REPAIRED, acknowledgment
 
     async def _has_payload(self, candidate: _Candidate) -> bool:
         event = await self.payloads.capture(candidate.user_id, candidate.item_id)

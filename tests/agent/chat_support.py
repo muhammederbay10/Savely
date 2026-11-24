@@ -53,6 +53,7 @@ from tests.db_factories import INSTAGRAM
 
 HINT_WINDOW = timedelta(seconds=30)
 HINT_MIN_PROBABILITY = 0.7
+ROUTING_TIMEOUT_SECONDS = 5.0
 SESSION_LIFETIME = timedelta(hours=24)
 HISTORY_MESSAGES = 20
 RUN_DEADLINE_SECONDS = 10.0
@@ -221,12 +222,16 @@ def build_chat(
     *,
     send_answers: Sequence[httpx.Response | Exception] | None = None,
     routing_model: Classifier | None = None,
+    routing_sessions: async_sessionmaker[AsyncSession] | None = None,
+    routing_timeout_seconds: float = ROUTING_TIMEOUT_SECONDS,
+    run_deadline_seconds: float = RUN_DEADLINE_SECONDS,
     **agent_settings: int,
 ) -> ChatUnderTest:
     """The responder with the real tools and stores, a scripted text model and a mock Send API.
 
     `routing_model` decides whether a text right after a share names a
     collection; by default it answers nothing, so every such text is chat.
+    `routing_sessions` lets a test make the routing's database writes fail.
     """
     agent = build_agent(
         stores.sessions,
@@ -241,18 +246,19 @@ def build_chat(
     responder = ChatResponder(
         payloads=ChatPayloads(stores.state),
         routes=TextRouter(
-            stores.sessions,
+            routing_sessions or stores.sessions,
             stores.state,
             routing_model or FakeClassifier(),
             ROUTING_PROMPTS,
             min_probability=HINT_MIN_PROBABILITY,
+            decision_timeout_seconds=routing_timeout_seconds,
         ),
         memory=stores.memory,
         conversations=ConversationStore(stores.sessions),
         agent=agent.agent,
         toolbox=agent.toolbox,
         sender=sender,
-        run_deadline_seconds=RUN_DEADLINE_SECONDS,
+        run_deadline_seconds=run_deadline_seconds,
         store_tries=STORE_TRIES,
         store_retry_delay_seconds=STORE_RETRY_DELAY_SECONDS,
         now=stores.clock,
