@@ -138,8 +138,8 @@ async def confirmation_started(session: AsyncSession, saved_item_id: uuid.UUID) 
     return rows.first() is not None
 
 
-async def step_status(session: AsyncSession, saved_item_id: uuid.UUID, step: Step) -> str | None:
-    """Return the status of one of the item's steps.
+async def lock_step(session: AsyncSession, saved_item_id: uuid.UUID, step: Step) -> str | None:
+    """Lock one of the item's step rows `FOR UPDATE` until the transaction ends, and read it.
 
     Args:
         session: The session to work in.
@@ -150,9 +150,9 @@ async def step_status(session: AsyncSession, saved_item_id: uuid.UUID, step: Ste
         The step's `RunStatus` value; `None` if the step has no row.
     """
     return await session.scalar(
-        select(EnrichmentRun.status).where(
-            EnrichmentRun.saved_item_id == saved_item_id, EnrichmentRun.step == step
-        )
+        select(EnrichmentRun.status)
+        .where(EnrichmentRun.saved_item_id == saved_item_id, EnrichmentRun.step == step)
+        .with_for_update()
     )
 
 

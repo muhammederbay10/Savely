@@ -8,33 +8,41 @@ fake. Every id and text is synthetic.
 
 import asyncio
 import uuid
-from datetime import datetime, timedelta
+from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from arq.connections import ArqRedis
 from sqlalchemy import func, select, update
 
+from app.adapters.base import CaptureEvent, ChatMessage
 from app.agent.replies.messenger import OutgoingMessage, SendResult
 from app.db.deletion import UserDataEraser
 from app.db.models import EnrichmentRun, ItemStatus, SavedItem, User
 from app.ingestion.erasure import IngestionDataEraser
 from app.ingestion.jobs import ArqJobQueue
 from app.ingestion.repository import lock_user
+from app.ingestion.service import IngestionOutcome, IngestionService
 from app.ingestion.session_state import RedisIngestionState
 from app.pipeline.recovery.acknowledgment import (
     CollectionAcknowledger,
     CollectionAcknowledgment,
     claim_collection_acknowledgment,
 )
-from app.pipeline.recovery.runs import load_item
+from app.pipeline.recovery.runs import RunStatus, Step, load_item
 from app.pipeline.steps.confirm import SaveConfirmer
 from tests.pipeline.harness import Pipeline, add_item, add_user
 from tests.pipeline.support import RecordingMessenger, capture_event
+from tests.webhooks import RecordingJobQueue
 
 COLLECTION = "Filmler"
 STATE_LIFETIME = timedelta(hours=1)
 # Long enough for an erasure that doesn't wait to finish.
 ERASURE_WAITS_SECONDS = 0.5
+# Bounds on waits that must not block on the send's hold; far longer than they take.
+INGESTION_MAX_SECONDS = 5.0
+OVERLAP_WAIT_SECONDS = 0.5
+HINT_WINDOW_SECONDS = 30
 
 
 class PausedMessenger(RecordingMessenger):
@@ -56,6 +64,18 @@ class PausedMessenger(RecordingMessenger):
 @pytest.fixture
 def pipeline(committed_pipeline: Pipeline) -> Pipeline:
     return committed_pipeline
+
+
+@pytest.fixture
+def messenger(pipeline: Pipeline) -> Iterator[PausedMessenger]:
+    """A paused Send API, always let go: a failed test never leaves a send holding locks."""
+    paused = PausedMessenger()
+    yield paused
+    paused.release.set()
+
+
+async def entered_send(messenger: PausedMessenger) -> None:
+    await asyncio.wait_for(messenger.entered.wait(), INGESTION_MAX_SECONDS)
 
 
 def eraser(pipeline: Pipeline, redis: ArqRedis) -> UserDataEraser:
@@ -101,6 +121,30 @@ async def left_of(pipeline: Pipeline, claimed: CollectionAcknowledgment) -> tupl
     return users or 0, items or 0, runs or 0
 
 
+def new_text(user_id: uuid.UUID) -> ChatMessage:
+    return ChatMessage(
+        user_id=user_id,
+        platform="instagram",
+        text="What did i save?",
+        message_id=f"mid-synthetic-{uuid.uuid4().hex}",
+        received_at=datetime.now(UTC),
+    )
+
+
+def new_share(user_id: uuid.UUID) -> CaptureEvent:
+    return capture_event(user_id).model_copy(
+        update={
+            "source_message_id": f"mid-synthetic-share-{uuid.uuid4().hex}",
+            "platform_post_id": f"synthetic-post-{uuid.uuid4().hex}",
+            "received_at": datetime.now(UTC),
+        }
+    )
+
+
+async def ingestion_state_cleanup(redis: ArqRedis, user_id: uuid.UUID) -> None:
+    await RedisIngestionState(redis, STATE_LIFETIME).erase_user(user_id)
+
+
 async def redis_keys_of(redis: ArqRedis, user_id: uuid.UUID) -> list[bytes]:
     return list(await redis.keys(f"savely:*{user_id}*"))
 
@@ -121,14 +165,13 @@ async def test_a_user_deleted_after_the_claim_gets_no_dm_and_nothing_is_recreate
 
 
 async def test_deletion_waits_for_an_acknowledgment_being_sent_and_then_erases_everything(
-    pipeline: Pipeline, ingestion_redis: ArqRedis
+    pipeline: Pipeline, ingestion_redis: ArqRedis, messenger: PausedMessenger
 ) -> None:
     claimed = await failed_named_item(pipeline)
-    messenger = PausedMessenger()
     acknowledger = CollectionAcknowledger(pipeline.sessions, SaveConfirmer(messenger))
 
     sending = asyncio.create_task(acknowledger.send(claimed))
-    await messenger.entered.wait()
+    await entered_send(messenger)
     erasing = asyncio.create_task(eraser(pipeline, ingestion_redis).erase(claimed.user_id))
     await asyncio.sleep(ERASURE_WAITS_SECONDS)
 
@@ -145,3 +188,60 @@ async def test_deletion_waits_for_an_acknowledgment_being_sent_and_then_erases_e
     await acknowledger.send(claimed)
     assert len(messenger.sent) == 1
     assert await left_of(pipeline, claimed) == (0, 0, 0)
+
+
+async def test_new_messages_are_ingested_while_an_acknowledgment_is_being_sent(
+    pipeline: Pipeline, ingestion_redis: ArqRedis, messenger: PausedMessenger
+) -> None:
+    claimed = await failed_named_item(pipeline)
+    acknowledger = CollectionAcknowledger(pipeline.sessions, SaveConfirmer(messenger))
+    jobs = RecordingJobQueue()
+    ingestion = IngestionService(
+        pipeline.sessions,
+        jobs,
+        RedisIngestionState(ingestion_redis, STATE_LIFETIME),
+        timedelta(seconds=HINT_WINDOW_SECONDS),
+    )
+    sending = asyncio.create_task(acknowledger.send(claimed))
+    await entered_send(messenger)
+
+    # The send holds the user's row only against "delete my data", not against the webhook.
+    text = await asyncio.wait_for(
+        ingestion.ingest_chat_message(new_text(claimed.user_id)), INGESTION_MAX_SECONDS
+    )
+    share = await asyncio.wait_for(
+        ingestion.ingest_capture(new_share(claimed.user_id)), INGESTION_MAX_SECONDS
+    )
+
+    assert (text, share) == (IngestionOutcome.CHAT_QUEUED, IngestionOutcome.ITEM_SAVED)
+    assert not sending.done()
+    messenger.release.set()
+    await asyncio.wait_for(sending, INGESTION_MAX_SECONDS)
+    assert [text for _, text in messenger.sent] == ["Filmler koleksiyonuna kaydedildi"]
+    await ingestion_state_cleanup(ingestion_redis, claimed.user_id)
+
+
+async def test_overlapping_sends_of_one_claim_send_it_once(
+    pipeline: Pipeline, messenger: PausedMessenger
+) -> None:
+    claimed = await failed_named_item(pipeline)
+    acknowledger = CollectionAcknowledger(pipeline.sessions, SaveConfirmer(messenger))
+
+    first = asyncio.create_task(acknowledger.send(claimed))
+    await entered_send(messenger)
+    second = asyncio.create_task(acknowledger.send(claimed))
+    # The second waits for the first's claim; it never reaches the Send API meanwhile.
+    done, _ = await asyncio.wait({second}, timeout=OVERLAP_WAIT_SECONDS)
+    assert done == set()
+    messenger.release.set()
+    await asyncio.wait_for(asyncio.gather(first, second), INGESTION_MAX_SECONDS)
+
+    assert [text for _, text in messenger.sent] == ["Filmler koleksiyonuna kaydedildi"]
+    async with pipeline.sessions() as session:
+        status = await session.scalar(
+            select(EnrichmentRun.status).where(
+                EnrichmentRun.saved_item_id == claimed.saved_item_id,
+                EnrichmentRun.step == Step.CONFIRM,
+            )
+        )
+    assert status == RunStatus.DONE

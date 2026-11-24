@@ -19,13 +19,17 @@ Two steps, like the save confirmation:
    send is recorded and not tried again.
 
 **"Delete my data" never races the send** (the chat worker's protocol). Step 2
-takes the user's row with `FOR KEY SHARE`, which the erasure's `FOR UPDATE`
-waits for, and keeps it while it reads what to send, sends and records. The
-claim carries only ids: the recipient, the language and the collection are
-read again under that hold. A user or item deleted after the claim gets
-nothing, and nothing is written for them; an erasure that starts while the
-message is being sent waits for it, then erases everything. Only a claim
-that is still `started` is sent, so a repeated send sends nothing.
+takes the user's row `FOR KEY SHARE`, which only the erasure's `FOR UPDATE`
+waits for, and keeps it while it reads what to send, sends and records; the
+webhook, which locks the user's row too, never waits for a send. The claim
+carries only ids: the recipient, the language and the collection are read
+again under that hold. A user or item deleted after the claim gets nothing,
+and nothing is written for them; an erasure that starts while the message is
+being sent waits for it, then erases everything.
+
+**Once.** Step 2 also locks the item's confirm-step row `FOR UPDATE`, and sends
+only while it is still `started`. An overlapping send of the same claim waits
+for that row, then finds it recorded and sends nothing.
 """
 
 import logging
@@ -33,20 +37,20 @@ import uuid
 from dataclasses import dataclass
 from typing import Final
 
+from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.db.models import SavedItem
-from app.ingestion.repository import lock_user
+from app.db.models import SavedItem, User
 from app.pipeline.recovery.runs import (
     RunStatus,
     Step,
     confirmation_started,
     language_of,
     load_item,
+    lock_step,
     recipient_of,
     record_step,
-    step_status,
 )
 from app.pipeline.steps.confirm import Confirmation, ConfirmationStatus, SaveConfirmer
 
@@ -151,14 +155,16 @@ class CollectionAcknowledger:
     async def _send_held(
         self, session: AsyncSession, claimed: CollectionAcknowledgment
     ) -> Confirmation | None:
-        """Read, send and record under the user's row lock; `None` if nothing may be sent."""
-        # Held until the transaction ends: an erasure waits for the send and the record.
-        if not await lock_user(session, claimed.user_id):
+        """Read, send and record, holding the user and the claim; `None` if nothing may be sent."""
+        # Both are held until the transaction ends. The erasure's FOR UPDATE on the
+        # user waits for the send and the record; ingestion's lock doesn't.
+        if not await _hold_user(session, claimed.user_id):
+            return None
+        # An overlapping send of the same claim waits here, then finds it used.
+        if await lock_step(session, claimed.saved_item_id, Step.CONFIRM) != RunStatus.STARTED:
             return None
         item = await load_item(session, claimed.saved_item_id)
         if item is None or item.user_id != claimed.user_id or item.collection is None:
-            return None
-        if await step_status(session, item.id, Step.CONFIRM) != RunStatus.STARTED:
             return None
         confirmation = await self._confirmer.confirm_collection(
             recipient_id=await recipient_of(session, item.user_id, item.platform),
@@ -174,3 +180,16 @@ class CollectionAcknowledger:
             output={**confirmation.to_output(), **_OUTPUT},
         )
         return confirmation
+
+
+async def _hold_user(session: AsyncSession, user_id: uuid.UUID) -> bool:
+    """Take the user's row `FOR KEY SHARE` until the transaction ends, like an answer's hold.
+
+    It conflicts only with the erasure's `FOR UPDATE`, not with ingestion, the
+    indexer or another hold, so the webhook never waits for a send.
+
+    Returns:
+        Whether the user exists. `False` means they were deleted.
+    """
+    statement = select(User.id).where(User.id == user_id).with_for_update(read=True, key_share=True)
+    return (await session.execute(statement)).scalar_one_or_none() is not None
