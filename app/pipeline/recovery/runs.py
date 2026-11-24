@@ -138,6 +138,24 @@ async def confirmation_started(session: AsyncSession, saved_item_id: uuid.UUID) 
     return rows.first() is not None
 
 
+async def step_status(session: AsyncSession, saved_item_id: uuid.UUID, step: Step) -> str | None:
+    """Return the status of one of the item's steps.
+
+    Args:
+        session: The session to work in.
+        saved_item_id: The item.
+        step: The step.
+
+    Returns:
+        The step's `RunStatus` value; `None` if the step has no row.
+    """
+    return await session.scalar(
+        select(EnrichmentRun.status).where(
+            EnrichmentRun.saved_item_id == saved_item_id, EnrichmentRun.step == step
+        )
+    )
+
+
 async def record_step(
     session: AsyncSession,
     saved_item_id: uuid.UUID,
