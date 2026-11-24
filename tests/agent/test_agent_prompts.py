@@ -2,6 +2,7 @@ from dataclasses import replace
 
 import pytest
 
+from app.agent.agent import AnswerOutcome
 from app.agent.prompts import AGENT_PROMPTS
 
 
@@ -31,3 +32,10 @@ def test_the_system_prompt_names_the_result_cap_and_every_notice() -> None:
     assert "The first 5 are sent as replies" in system
     for notice in ("backup_mode", "broader_results", "may_be_incomplete"):
         assert notice in system
+
+
+def test_the_system_prompt_names_every_answer_outcome() -> None:
+    system = AGENT_PROMPTS.system.format(max_results=5)
+
+    for outcome in AnswerOutcome:
+        assert f"'{outcome.value}'" in system

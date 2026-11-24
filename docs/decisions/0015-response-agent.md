@@ -56,3 +56,20 @@ Muhammed decided all nine questions in chat on 2026-11-20 ("Approve all nine"). 
 - **Schema:** `saved_item.user_status` (migration 0003, Q6). `ChatMessage.quick_reply_payload` is a new optional field of the adapter's output.
 - **New settings:** `AGENT_MAX_STEPS`, `AGENT_MAX_RESULTS_PER_ANSWER`, `AGENT_MAX_OUTPUT_TOKENS`, `VOCAB_ALIAS_REVIEW_MIN_USERS`, `DATA_DELETION_CONFIRM_SECONDS`.
 - **Costs:** one text-model call per step; one more per answer only for a language without built-in wording.
+
+## Update: tool steps and the answer step (SAV-38, 24 Nov 2026)
+
+**Context.** In the owner's live test on `e30b152`, the bot answered "What did i save?" with "Let me pull up your saves." and no items; the log had `agent_answered steps=3 results=0` and no `agent_tool_called`. Replayed through the real `ResponseAgent`, `deepseek/deepseek-v4.1-flash` on CoreWeave never called a tool in 3 of 3 tries when a request carried both the tools and the answer's `response_format`; it went straight to the final JSON, once with "Here's what you saved most recently." and no items. With the same messages and tools but no `response_format`, it called `search_items` in 3 of 3 tries.
+
+**Decision.**
+- **Tool steps send the tools and no answer format** (`tool_choice="auto"`). When the model stops calling tools, a reply that is already a valid answer object is taken as it is; otherwise the next call is the **answer step**: the answer format, with tool calls forbidden (`tool_choice="none"`; the tools are still listed because the conversation holds tool calls). The last step is always an answer step, as before.
+- **The answer carries `outcome`**: `results` (the reply shows the items in `item_ids`, which must not be empty), `no_results` (a search found nothing; `item_ids` is empty) or `other` (a question, a greeting, a confirmation). The model reports it, so the check works in any language and never reads the reply's words. An answer whose `outcome` does not match `item_ids` is sent back like any other failed check. The deletion question replaces the reply, so it is not checked there.
+- **Where a failed answer goes:** a malformed answer is asked for again in the answer step; any other failed check goes back to a tool step, so the model can search before it answers again.
+- The prompt (`2026-11-24.1`) tells the model to call the tools before it answers, never to promise to look, and how to set `outcome`.
+- **Real-model check:** `tests/live/test_response_agent_live.py`, opt-in, run by the owner before a push (SAV-22, 24 Nov 2026 update).
+
+**Alternatives considered.**
+- **`tool_choice="required"` with a "reply" tool for the answer:** one call fewer, but the live evidence covers only "tools without a format", and whether the pinned provider honours `required` with this model was not checked. It also changes the answer's contract (see the alternatives above).
+- **Matching words like "here's what you saved" in the reply:** works in one language only; ruled out by decision record 0005.
+
+**Consequences.** An answer the model writes in prose costs one more call (the answer step), within `AGENT_MAX_STEPS`. The answer schema has a new required field, `outcome`.
