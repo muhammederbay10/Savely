@@ -452,7 +452,7 @@ The text-model test also checks, from the reply's routing metadata, that the pin
 
 `tests/live/test_response_agent_live.py` checks that the response agent, on the **real text model**, calls a search tool and answers with saved items (SAV-38). It asks four questions in English and Turkish ("What did i save?", "restaurants in Kadıköy", "kaydettiğim tatlıcılar", "netflixte ne izleyebilirim"), each three times, against the synthetic test saves; every question has matching saves, so each run must call `search_items` or `near` and send at least one item. Search's filter normalization uses the real decision model too. Embeddings are offline (the test database stores 8-dimensional vectors), so ranking by meaning is not covered.
 
-Every change to a model call or to the agent's prompts needs this check before its push (SAV-22, 24 Nov 2026). The owner runs it locally, never in CI and never in an agent's worktree, because the key must not go there. It needs the live switch, the key and the test database; a run costs a few cents:
+Every change to a model call or to the agent's prompts needs this check before its push (SAV-22, 24 Nov 2026). The owner runs it locally, never in CI and never in an agent's worktree, because the key must not go there. It is always skipped when `CI` is set (any value but empty, `0` or `false`), even with the live switch and a key, before any model client is built; `tests/live/test_response_agent_live_gate.py` checks this offline. It needs the live switch, the key and the test database; a run costs a few cents:
 
 ```bash
 docker compose up --detach --wait db

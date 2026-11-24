@@ -14,14 +14,16 @@ embeddings are offline (the test database stores 8-dimensional vectors), so
 ranking by meaning is not tested.
 
 It is skipped unless `LIVE_MODEL_TESTS=1`, `OPENROUTER_API_KEY` and
-`TEST_DATABASE_ADMIN_URL` are set. It never runs in CI or in an agent's
-worktree; the owner runs it locally before a push (SAV-22, 24 Nov 2026
-update). `docs/development.md` ("Live response agent check") shows how and
+`TEST_DATABASE_ADMIN_URL` are set, and always skipped when `CI` is set: the
+module's skip mark is decided at import, before any fixture builds a model
+client (`tests/live/test_response_agent_live_gate.py` proves it). It never
+runs in CI or in an agent's worktree; the owner runs it locally before a
+push (SAV-22, 24 Nov 2026 update). `docs/development.md` ("Live response agent check") shows how and
 how to read the result. A run costs a few cents.
 """
 
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
 
 import pytest
@@ -54,13 +56,25 @@ from tests.pipeline.support import ScriptedClassifier
 
 OPT_IN_VARIABLE = "LIVE_MODEL_TESTS"
 API_KEY_VARIABLE = "OPENROUTER_API_KEY"
+# Set by GitHub Actions and most CI services. Any value but these counts as CI.
+CI_VARIABLE = "CI"
+NOT_CI_VALUES = frozenset({"", "0", "false"})
+
+
+def live_run_blocker(environ: Mapping[str, str]) -> str | None:
+    """Return why the live check may not run in this environment, or `None` if it may."""
+    if environ.get(CI_VARIABLE, "").strip().casefold() not in NOT_CI_VALUES:
+        return f"the live response agent check never runs in CI ({CI_VARIABLE} is set)"
+    if environ.get(OPT_IN_VARIABLE) != "1" or not environ.get(API_KEY_VARIABLE):
+        return f"live model tests need {OPT_IN_VARIABLE}=1 and {API_KEY_VARIABLE}"
+    return None
+
+
+_BLOCKER = live_run_blocker(os.environ)
 
 pytestmark = [
     pytest.mark.live,
-    pytest.mark.skipif(
-        os.environ.get(OPT_IN_VARIABLE) != "1" or not os.environ.get(API_KEY_VARIABLE),
-        reason=f"live model tests need {OPT_IN_VARIABLE}=1 and {API_KEY_VARIABLE}",
-    ),
+    pytest.mark.skipif(_BLOCKER is not None, reason=_BLOCKER or ""),
 ]
 
 RUNS_PER_QUESTION = 3
