@@ -33,11 +33,12 @@ class Step(StrEnum):
 
 
 class RunStatus(StrEnum):
-    """How a step ended."""
+    """How a step ended, or, for the confirmation, that it started to be sent."""
 
     DONE = "done"
     FAILED = "failed"
     SKIPPED = "skipped"
+    STARTED = "started"
 
 
 JsonObject = dict[str, object]
@@ -92,6 +93,29 @@ async def finished_steps(session: AsyncSession, saved_item_id: uuid.UUID) -> dic
         )
     )
     return {Step(row.step): dict(row.output or {}) for row in rows}
+
+
+async def confirmation_started(session: AsyncSession, saved_item_id: uuid.UUID) -> bool:
+    """Tell whether the item's save confirmation started to be sent, whatever came of it.
+
+    The indexer records the start under the owner's row lock, together with
+    reading the item's collection (`ItemIndexer`). A caller that holds the same
+    lock learns whether a collection it sets now still makes it into that
+    confirmation (`False`) or comes too late for it (`True`).
+
+    Args:
+        session: The session to work in.
+        saved_item_id: The item.
+
+    Returns:
+        Whether the item has a row for the confirm step.
+    """
+    rows = await session.execute(
+        select(EnrichmentRun.id).where(
+            EnrichmentRun.saved_item_id == saved_item_id, EnrichmentRun.step == Step.CONFIRM
+        )
+    )
+    return rows.first() is not None
 
 
 async def record_step(

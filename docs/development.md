@@ -139,24 +139,24 @@ Users share posts and reels with the bot account by direct message, or save them
 | Endpoint | What it does |
 |---|---|
 | `GET /webhooks/instagram` | Meta's verification handshake. Returns `hub.challenge` when `hub.verify_token` equals `META_WEBHOOK_VERIFY_TOKEN`, and 403 otherwise |
-| `POST /webhooks/instagram` | Receives a webhook. Checks `X-Hub-Signature-256` against the raw body with `META_APP_SECRET` (401 if it is missing or wrong), stores the share or routes the text, queues a job and answers 200 |
+| `POST /webhooks/instagram` | Receives a webhook. Checks `X-Hub-Signature-256` against the raw body with `META_APP_SECRET` (401 if it is missing or wrong), stores the share or the text's receipt, queues a job and answers 200. It calls no model |
 
-What happens to a message ([`app/adapters/instagram.py`](../app/adapters/instagram.py), decision records 0002, 0003 and 0009):
+What happens to a message ([`app/adapters/instagram.py`](../app/adapters/instagram.py), decision records 0002, 0003, 0009 and 0018):
 
 | Message | Result |
 |---|---|
 | A reel shared by DM (`ig_reel`) | A saved item with the reel's id, public link and caption |
 | A post shared by DM or saved into the collection (`ig_post`, or the older `share`) | A saved item with the post's id (`ig_post` only) and caption. The signed image link is passed to the indexing job and not stored |
 | A reel saved into the collection (`unsupported_type`) | A saved item with only its message id. The signed video link is passed to the indexing job and not stored |
-| A text sent at most `COLLECTION_HINT_WINDOW_SECONDS` after the user's last share before it (also a repeated share of a saved post, and also when a later share arrived first) | Stored as that share's item's collection, e.g. "For my movies collection", if it has none yet. No chat job |
-| Any other text | A chat job for the response agent |
+| A text sent at most `COLLECTION_HINT_WINDOW_SECONDS` after the user's last share before it (also a repeated share of a saved post, and also when a later share arrived first), whose item has no collection yet, unless it is a tap on one of the bot's buttons | A chat job, with that item bound to the text's receipt (route `undecided`). The chat worker asks the decision model whether the text names the item's collection (see [Chat worker](#chat-worker)) |
+| Any other text | A chat job for the response agent (route `chat`), with no model call for routing |
 | Anything else (read receipts, reactions, the bot's own messages, other attachments) | Ignored, and logged without its content |
 
 - **First contact:** the first message from an Instagram account creates its `user` and `platform_account` rows.
 - **Message id:** every saved item keeps the id of the message it came in with (`source_message_id`), so answers can reply to it (decision record 0004).
 - **One item per post and per message:** sharing the same post twice, or a webhook that Meta delivers twice, creates one saved item. Two reels saved into the collection have no post id, so they stay two items (decision record 0007).
 - **Jobs:** new items are queued as `index_saved_item` and texts as `answer_chat_message` on Redis, through `arq` ([`app/ingestion/jobs.py`](../app/ingestion/jobs.py)). A job holds only ids; the caption, text and media link it works on are in a per-user payload hash ([`app/ingestion/session_state.py`](../app/ingestion/session_state.py)). Each job name has its own arq queue (`arq:queue:indexing`, `arq:queue:chat`), so a worker only takes the jobs it can run. The indexing worker runs `index_saved_item` (see [Indexing pipeline](#indexing-pipeline)). The chat worker runs `answer_chat_message` (see [Chat worker](#chat-worker)).
-- **Routing is decided once:** each text's route is kept as a receipt by its message id before anything changes, so a repeated delivery is routed the same way, also when a delayed share arrived in between.
+- **A text is bound once:** each text's receipt, with the share it is bound to, is kept by its message id before its job is queued, so a repeated delivery is handled the same way and queued once, also when a delayed share arrived in between. The chat worker writes the decided route into the same receipt.
 - **Ingestion state:** payloads, text receipts, each user's recent shares and their message count stay in Redis for `INGESTION_STATE_TTL_SECONDS`, and "delete my data" erases them.
 - **Message numbers:** every new share or text gets the user's next number, in the order ingestion takes them in, once per platform message id: a repeated delivery of the same message keeps its first number, while a new message sharing an already shared post gets a new one. A share without a message id can't be told from its repeats, so each of its deliveries counts. A "delete my data" question can be confirmed only by the message numbered right after the last one before it was sent (see [Chat worker](#chat-worker)).
 - **Errors:** if Postgres or Redis is down, the endpoint answers 500 and Meta delivers the webhook again. Handling a webhook twice is safe.
@@ -215,7 +215,7 @@ All configuration comes from environment variables. Locally they live in `.env`,
 | `EMBEDDING_DIMENSION` | API, migrations | Length of the embedding vectors, 1 to 2000. Must match the embedding model: `1024` for `openai/text-embedding-3-large` (see [Database](#database)) |
 | `META_APP_SECRET` | API | The Meta app's secret. Every webhook is signed with it. **Secret** |
 | `META_WEBHOOK_VERIFY_TOKEN` | API | The text Meta repeats in the verification handshake. You choose it and enter it in the Meta app. **Secret** |
-| `COLLECTION_HINT_WINDOW_SECONDS` | API | A text sent this many seconds or less after a share becomes that item's collection hint. A whole number above 0 |
+| `COLLECTION_HINT_WINDOW_SECONDS` | API | Upper bound for collection hints: only a text sent this many seconds or less after a share may name that item's collection, and the chat worker asks the decision model whether it does (record 0018). A later text is chat with no model call. A whole number above 0 |
 | `INGESTION_STATE_TTL_SECONDS` | API | How long ingestion keeps a user's job payloads, text receipts and recent shares in Redis. At least the hint window; 129600 (36 hours, Meta's documented retry period) in `.env.example` |
 | `INSTAGRAM_GRAPH_API_URL` | DM replies | Graph API base URL with its version, e.g. `https://graph.facebook.com/v27.0` (see [DM replies](#dm-replies)) |
 | `INSTAGRAM_ACCOUNT_ID` | DM replies | The bot's Instagram professional account id |
@@ -463,6 +463,25 @@ LIVE_MODEL_TESTS=1 TEST_DATABASE_ADMIN_URL=postgresql+asyncpg://savely:change-me
 
 Each test id names the question and the run (`[en-What did i save?-2]`), so the passed runs per question are the rate to report. A failure says what happened, for example `no search tool was called: run=2 prompts=2026-11-24.1 answered_in=en model_calls=2 tools=[] items=0`. Post the tested SHA, the text model and provider (`TEXT_MODEL`, `TEXT_MODEL_PROVIDER`), and the passed runs per question on the ticket.
 
+### Live routing check
+
+`tests/live/test_collection_routing_live.py` checks that the **real decision model** tells collection names from questions when they are sent right after a share (SAV-39, decision record 0018). It asks the production question (`ROUTING_PROMPTS`) about 24 synthetic texts in English, Turkish, Spanish and Japanese, half collection names ("Food", "Filmler", "para mi colección de viajes", "勉強") and half questions or small talk ("What did i save?", "bu nerede?", "hola", "ありがとう"), and compares each probability with your `COLLECTION_HINT_MIN_PROBABILITY`. It needs no database. A run costs a fraction of a cent.
+
+Like the response agent check, it is opt-in, never runs in CI (it is skipped whenever `CI` is set, before any client is built; `tests/live/test_collection_routing_live_gate.py` checks this offline) and is skipped without the live switch and the key. The owner runs it locally, never in an agent's worktree. **Run it in the same session as SAV-38's check**, in the main checkout (the one with `.env`) at the SAV-39 head, which already contains SAV-38's head:
+
+```bash
+git switch --detach <SAV-39 head SHA>   # switch back to your branch afterwards
+docker compose up --detach --wait db
+set -a; source .env; set +a      # needs COLLECTION_HINT_MIN_PROBABILITY and the DECISION_* settings
+LIVE_MODEL_TESTS=1 TEST_DATABASE_ADMIN_URL=postgresql+asyncpg://savely:change-me@localhost:5432/postgres \
+  pytest tests/live/test_response_agent_live.py tests/live/test_collection_routing_live.py \
+  -v --log-cli-level=INFO
+```
+
+Each test id names the language, the expected route and the text (`[ja-question-ありがとう]`), so the passed cases out of 24 are the accuracy. With `--log-cli-level=INFO` every case logs a `routing_case` line with its probability, which shows how close each text is to the threshold. A wrong route fails with, for example, `wrong route: language=en expected=question routed=collection probability=0.81 threshold=0.7 prompts=2026-11-24.1`.
+
+Post on SAV-39: the tested SHA (and SAV-38's head it contains), the decision model and endpoint (`DECISION_MODEL`, `OPENROUTER_DECISIONS_URL`), the threshold, the accuracy overall and per language, and every wrong route with its probability. Post SAV-38's results on SAV-38.
+
 ## Content types
 
 Every saved post gets an open **category** and **tags**, written by the text model in plain words and in any language ("restaurant", "car review", "ギターレッスン"). Nothing is picked from a list in code, and nothing is tied to a city, a country or a language (decision record 0005, SAV-26).
@@ -663,17 +682,18 @@ Under Compose, the `chat_worker` service runs the same command. Like the indexin
 
 For each text ([`app/agent/chat.py`](../app/agent/chat.py)):
 
-1. Read the message and its number from ingestion's state; none means the user was deleted, and the job stops.
-2. Load the sender's profile (their IGSID, country and home area) and short-term memory (the last messages and the working set).
-3. Run the response agent for that user only, with the user taken from the DM's sender. `deletion_confirmed` is set only when the message is a tap on the "Yes, delete" button, and the message's number must be the one the delivered question waits for: the sender's next message after it was sent. A "no", a share or any other message in between uses the question up, also when the tap's job runs first.
-4. Send the answer within Instagram's 24-hour window, counted from when the user sent the text.
-5. Store the exchange and the new working set in Redis, the messages in `conversation_msg`, and the language the user wrote in as `user.language` (the save confirmations use it).
+1. Read the message and its receipt from ingestion's state; none means the user was deleted, and the job stops.
+2. Load the sender's profile (their IGSID, country, home area and language), then settle the route of a text sent right after a share ([`app/ingestion/text_routing.py`](../app/ingestion/text_routing.py), decision record [0018](decisions/0018-model-decides-collection-hints.md)); see [Collection names after a share](#collection-names-after-a-share). A collection name is not answered.
+3. For chat, load the sender's short-term memory (the last messages and the working set).
+4. Run the response agent for that user only, with the user taken from the DM's sender. `deletion_confirmed` is set only when the message is a tap on the "Yes, delete" button, and the message's number must be the one the delivered question waits for: the sender's next message after it was sent. A "no", a share or any other message in between uses the question up, also when the tap's job runs first.
+5. Send the answer within Instagram's 24-hour window, counted from when the user sent the text.
+6. Store the exchange and the new working set in Redis, the messages in `conversation_msg`, and the language the user wrote in as `user.language` (the save confirmations use it).
 
-**One answer at a time per sender.** Steps 4 and 5 run while the job holds the sender's Postgres advisory lock (`ConversationStore.one_answer_at_a_time`), on a connection of its own that also runs the send and store transactions. The sender's next answer, or the bot's error message, waits until this one was sent and stored, so the working set is always the list the user saw last. The agent runs still overlap, and other users, ingestion and "delete my data" never wait for this lock.
+**One answer at a time per sender.** Steps 5 and 6 run while the job holds the sender's Postgres advisory lock (`ConversationStore.one_answer_at_a_time`), on a connection of its own that also runs the send and store transactions. The sender's next answer, or the bot's error message, waits until this one was sent and stored, so the working set is always the list the user saw last. The agent runs still overlap, and other users, ingestion and "delete my data" never wait for this lock.
 
 **Retention.** `conversation_msg` keeps every exchange until "delete my data" (Phase 1, record 0016); the Redis session expires after `SESSION_TTL_SECONDS`.
 
-**Answers never outlive "delete my data".** Steps 4 and 5 run while the job holds the user's row with `FOR KEY SHARE` ([`ConversationStore.hold`](../app/memory/conversation.py)), which the erasure's `FOR UPDATE` waits for, and only if the user still exists. An answer whose user was deleted first is neither sent nor stored; an erasure that starts while an answer is being sent or stored waits, then erases what was stored. Ingestion and other answers of the same user don't wait for this hold. Only the "done" message after a deletion is sent without it.
+**Answers never outlive "delete my data".** Steps 5 and 6 run while the job holds the user's row with `FOR KEY SHARE` ([`ConversationStore.hold`](../app/memory/conversation.py)), which the erasure's `FOR UPDATE` waits for, and only if the user still exists. An answer whose user was deleted first is neither sent nor stored; an erasure that starts while an answer is being sent or stored waits, then erases what was stored. Ingestion and other answers of the same user don't wait for this hold. Only the "done" message after a deletion is sent without it.
 
 **Short-term memory** ([`app/memory/session.py`](../app/memory/session.py)) keeps three keys per user, `savely:memory:<user id>:history|working_set|replies`, for `SESSION_TTL_SECONDS` after the last exchange. The history is the last `SESSION_HISTORY_MESSAGES` messages. The working set is the last answer's results in their numbered order, how many were shown, and the searches (tool and arguments) they came from: the model sees them by number for "the second one", knows which were not shown for "show more", and repeats the search with one more filter for "only the cheap ones". An answer that lists no items keeps the last working set. `replies` records per message how far its answer got: `sending` (it may have arrived, so it is never sent again), kept with the exchange the answer adds once sent; `delivered` (sent, and whether all of it was), and `stored`.
 
@@ -702,8 +722,23 @@ Every step can be repeated without doubling anything. If a store stays down, the
 | `CHAT_RETRY_DELAY_SECONDS` | The wait before a failed job runs again, times the try's number; also between attempts to store |
 | `CHAT_RUN_DEADLINE_SECONDS` | How long one try may take to prepare an answer; sending is not cut off |
 | `CHAT_JOB_TIMEOUT_SECONDS` | arq's own limit on one try; longer than the run deadline, only a backstop |
+| `COLLECTION_HINT_MIN_PROBABILITY` | How sure the decision model must be, above 0 and at most 1, that a text right after a share names its collection; below it the text is answered. `0.7` in `.env.example`, to be tuned on the [live routing check](#live-routing-check). **New in SAV-39: add it to your `.env`, or the chat worker won't start** |
 
-They are read through `ChatSettings` in [`app/config/chat.py`](../app/config/chat.py), with `get_chat_settings()`. The log lines (`chat_answer_retry`, `chat_answer_failed`, `chat_answer_send_failed`, `chat_exchange_store_failed`, `chat_exchange_not_stored`, `user_profile_updated`) hold error class names and field names only, never a message, a place or an id.
+They are read through `ChatSettings` in [`app/config/chat.py`](../app/config/chat.py), with `get_chat_settings()`. The log lines (`text_route_decided`, `text_route_decision_failed`, `collection_confirmation_failed`, `chat_answer_retry`, `chat_answer_failed`, `chat_answer_send_failed`, `chat_exchange_store_failed`, `chat_exchange_not_stored`, `user_profile_updated`) hold error class names and field names only, never a message, a place or an id.
+
+### Collection names after a share
+
+A user may name a collection right after sharing a post ("Food", "for my Movies collection", "Filmler", "勉強"), or ask a question ("What did i save?"). The webhook can't tell them apart without a model, and calls none: it binds the text to the share sent before it, within `COLLECTION_HINT_WINDOW_SECONDS`, and queues it like any text. The chat worker then decides once, before the response agent runs (decision record [0018](decisions/0018-model-decides-collection-hints.md)):
+
+| Situation | Route | Model call |
+|---|---|---|
+| No share within the window before the text, or its item already has a collection | Chat: answered | None |
+| The decision model's yes is at or above `COLLECTION_HINT_MIN_PROBABILITY` | Collection: stored as the item's `collection`, exactly as written; not answered | One yes/no question (`ROUTING_PROMPTS` in [`app/ingestion/prompts.py`](../app/ingestion/prompts.py)) |
+| Below the threshold, unanswered, or the call failed | Chat: answered | One, or a failed one |
+
+- **Once:** the decision is written to the text's receipt under the user's row lock, together with the collection. A retried job, an overlapping one or a repeated webhook follows the receipt and never asks again.
+- **Confirmation:** the indexer reads the item's collection and marks its save confirmation `started` in `enrichment_run` under the same lock, then sends. A collection set before that is in the save confirmation ("Saved as café · in Food"). One set after it gets one short message from the chat worker ("Saved to Food", "Food koleksiyonuna kaydedildi"), in the user's language (English while unknown), sent once: a later try finds the reply mark and sends nothing.
+- **Logs:** `text_route_decided` has the route, the reason (`above_threshold`, `below_threshold`, `unanswered`, `decision_failed`, `item_labelled`), the probability and the prompts version, never the text.
 
 ## Project layout
 

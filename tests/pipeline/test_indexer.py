@@ -5,20 +5,22 @@ Every caption, transcript and name is synthetic.
 """
 
 import logging
-from datetime import timedelta
+import uuid
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.agent.replies.messenger import OutgoingMessage, SendResult
 from app.db.models import EnrichmentRun, ItemStatus, SavedItem, Vocabulary
 from app.logging_config import configure_logging
 from app.models.base import TranscriptionAttempt, YesNoAnswer
 from app.models.errors import ModelUnavailableError
 from app.pipeline.indexer import IndexOutcome, RetryLaterError
 from app.pipeline.media.tools import MediaProbe
-from app.pipeline.recovery.runs import Step
+from app.pipeline.recovery.runs import Step, confirmation_started
 from app.pipeline.steps.classify import NONE_OF_THESE
 from app.types.registry import UnknownContentTypeError
 from tests.pipeline.harness import Pipeline, add_item, add_user, load
@@ -27,6 +29,7 @@ from tests.pipeline.support import (
     FALLBACK_STT_MODEL,
     IMAGE_BYTES,
     MediaServer,
+    RecordingMessenger,
     capture_event,
     movie_extraction,
     open_extraction,
@@ -100,7 +103,8 @@ async def test_a_place_reel_is_fetched_transcribed_extracted_and_normalized(
     assert item.embedding is not None
     assert set(await runs_of(pipeline, item_id)) == {step.value for step in Step}
     assert await vocabulary_values(pipeline, "cuisine") == {"specialty coffee": 1}
-    assert pipeline.messenger.sent == [(f"1000000000000141-{user_id}", "Saved as café")]
+    # The collection the user named for the post is part of its one confirmation.
+    assert pipeline.messenger.sent == [(f"1000000000000141-{user_id}", "Saved as café · in Food")]
 
 
 async def test_a_movie_list_post_keeps_every_movie_and_skips_speech_to_text(
@@ -333,6 +337,44 @@ async def test_an_item_with_no_media_and_no_caption_fails(pipeline: Pipeline) ->
     assert pipeline.classifier.calls == []
 
 
+class MessengerThatSeesTheStartMark(RecordingMessenger):
+    """Records, at the moment of sending, whether the confirmation was marked started."""
+
+    def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
+        super().__init__()
+        self.sessions = sessions
+        self.item_id: uuid.UUID | None = None
+        self.marked_when_sent: list[bool] = []
+
+    async def send(
+        self, recipient_id: str, message: OutgoingMessage, last_user_message_at: datetime
+    ) -> SendResult:
+        assert self.item_id is not None
+        async with self.sessions() as session:
+            self.marked_when_sent.append(await confirmation_started(session, self.item_id))
+        return await super().send(recipient_id, message, last_user_message_at)
+
+
+async def test_the_confirmation_is_marked_started_before_it_is_sent(pipeline: Pipeline) -> None:
+    # A collection the chat worker sets after the mark is confirmed by its own message.
+    messenger = MessengerThatSeesTheStartMark(pipeline.sessions)
+    pipeline.messenger = messenger
+    pipeline.script(
+        transcripts=[transcript("")],
+        fallback_transcripts=[transcript("")],
+        extractions=[structured_reply(open_extraction())],
+    )
+    user_id = await add_user(pipeline.sessions)
+    item_id = await add_item(pipeline.sessions, pipeline, capture_event(user_id))
+    messenger.item_id = item_id
+
+    await pipeline.indexer().index(user_id, item_id)
+
+    assert messenger.marked_when_sent == [True]
+    assert [text for _, text in messenger.sent] == ["Saved as car review"]
+    assert (await runs_of(pipeline, item_id))["confirm"].output["collection_included"] is False
+
+
 async def test_a_user_without_a_known_language_is_confirmed_in_english(
     pipeline: Pipeline,
 ) -> None:
@@ -354,6 +396,7 @@ async def test_a_user_without_a_known_language_is_confirmed_in_english(
         "reason": None,
         "language": "en",
         "language_choice": "fallback_no_language",
+        "collection_included": False,
     }
 
 

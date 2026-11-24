@@ -37,6 +37,11 @@ class ChatSettings(BaseSettings):
         chat_job_timeout_seconds: arq's own limit on one try
             (`CHAT_JOB_TIMEOUT_SECONDS`). It must be longer than the run
             deadline, to leave time for sending; it is only a backstop.
+        collection_hint_min_probability: How sure the decision model must be
+            that a text sent right after a share names a collection for it,
+            before the text is filed as the item's collection instead of
+            answered (`COLLECTION_HINT_MIN_PROBABILITY`, from 0 to 1; decision
+            record 0018). Below it, the text goes to the response agent.
     """
 
     model_config = SettingsConfigDict(
@@ -52,6 +57,7 @@ class ChatSettings(BaseSettings):
     chat_retry_delay_seconds: float = Field(gt=0, allow_inf_nan=False)
     chat_run_deadline_seconds: float = Field(gt=0, allow_inf_nan=False)
     chat_job_timeout_seconds: float = Field(gt=0, allow_inf_nan=False)
+    collection_hint_min_probability: float = Field(gt=0, le=1, allow_inf_nan=False)
 
     @model_validator(mode="after")
     def _job_timeout_leaves_time_to_send(self) -> Self:

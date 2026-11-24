@@ -1,5 +1,8 @@
 """Database work for ingestion: users on first contact, saved items, collection hints.
 
+Collection hints are written by the chat worker once it has decided a text's
+route (`app.ingestion.text_routing`), under the same user row lock.
+
 Every function runs inside the caller's transaction and never commits.
 
 Ingestion locks the user's row for the whole of its work on one message
@@ -162,18 +165,22 @@ async def is_unlabelled_item(
 
 async def set_collection_if_missing(
     session: AsyncSession, user_id: uuid.UUID, saved_item_id: uuid.UUID, collection: str
-) -> None:
+) -> bool:
     """Give a user's saved item its collection, unless it already has one.
 
-    Setting the same hint again changes nothing, so a repeated delivery is safe.
+    Setting the same hint again changes nothing, so a repeated try is safe.
 
     Args:
         session: The session to work in.
         user_id: The user the item must belong to.
         saved_item_id: The item's id.
         collection: The collection, as the user wrote it.
+
+    Returns:
+        Whether this call set it. `False` means the item has a collection
+        already, or is not the user's or is gone.
     """
-    await session.execute(
+    result = await session.execute(
         update(SavedItem)
         .where(
             SavedItem.id == saved_item_id,
@@ -181,7 +188,9 @@ async def set_collection_if_missing(
             SavedItem.collection.is_(None),
         )
         .values(collection=collection)
+        .returning(SavedItem.id)
     )
+    return result.first() is not None
 
 
 async def _find_user_id(

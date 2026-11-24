@@ -149,6 +149,8 @@ def translated_wording(language: str, separator: str = ", ") -> dict[str, str]:
     return {
         "saved_named": "«{item}»",
         "saved_as": "«{category}»",
+        "in_collection": "«{collection}»",
+        "saved_to": f"{language}: «{{collection}}»",
         "streaming_on": "{platforms}",
         "which_one": f"{language}: which one?",
         "none_of_these": f"{language}: none",

@@ -6,7 +6,9 @@ run never holds up an answer. It reads `Settings`, `ModelSettings`,
 `PipelineSettings`, `RetrievalSettings`, `AgentSettings`, `MessengerSettings`
 and `ChatSettings` from the environment.
 
-One job answers one message (`app.agent.chat.ChatResponder`). A worker runs up
+One job answers one message (`app.agent.chat.ChatResponder`). It first
+settles whether a text sent right after a share names that post's collection,
+with the decision model and `COLLECTION_HINT_MIN_PROBABILITY` (record 0018). A worker runs up
 to `CHAT_CONCURRENCY` jobs at once. A failure before sending that may pass
 later is tried again after `CHAT_RETRY_DELAY_SECONDS` times the try's number,
 up to `CHAT_MAX_TRIES` runs; the last one sends the error message instead.
@@ -57,7 +59,9 @@ from app.db.deletion import UserDataEraser
 from app.db.session import create_engine, create_session_factory
 from app.ingestion.erasure import IngestionDataEraser
 from app.ingestion.jobs import ANSWER_CHAT_MESSAGE_JOB, CHAT_QUEUE, ArqJobQueue
+from app.ingestion.prompts import ROUTING_PROMPTS
 from app.ingestion.session_state import RedisIngestionState
+from app.ingestion.text_routing import TextRouter
 from app.logging_config import configure_logging
 from app.memory.conversation import ConversationStore
 from app.memory.session import SessionMemory
@@ -245,10 +249,18 @@ async def start_worker(ctx: JobContext) -> None:
     )
     # Instagram is the only platform with a messenger so far (ARCHITECTURE §3.1).
     sender = AnswerSender(InstagramMessenger(messenger_http, get_messenger_settings()))
+    ingestion_state = RedisIngestionState(
+        redis, timedelta(seconds=settings.ingestion_state_ttl_seconds)
+    )
     ctx[_RESOURCES] = ChatWorkerResources(
         responder=ChatResponder(
-            payloads=ChatPayloads(
-                RedisIngestionState(redis, timedelta(seconds=settings.ingestion_state_ttl_seconds))
+            payloads=ChatPayloads(ingestion_state),
+            routes=TextRouter(
+                sessions,
+                ingestion_state,
+                models.classifier,
+                ROUTING_PROMPTS,
+                min_probability=chat_settings.collection_hint_min_probability,
             ),
             memory=session_memory(redis, chat_settings),
             conversations=ConversationStore(sessions),

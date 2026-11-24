@@ -22,7 +22,7 @@ from app.config.base import Settings
 from app.db.models import ItemStatus, PlatformAccount, SavedItem, User
 from app.ingestion.jobs import ANSWER_CHAT_MESSAGE_JOB, INDEX_SAVED_ITEM_JOB
 from app.ingestion.service import IngestionService
-from app.ingestion.session_state import RedisIngestionState
+from app.ingestion.session_state import RedisIngestionState, TextReceipt, TextRoute
 from tests.db_factories import count_rows
 from tests.webhooks import (
     COLLECTION_PHOTO,
@@ -206,17 +206,31 @@ async def test_first_message_from_an_account_creates_its_user(
 # --- Texts -----------------------------------------------------------------------
 
 
-async def test_text_sent_nine_seconds_after_a_reel_becomes_its_collection_hint(
+async def bound_receipt(
+    ingestion_state: RedisIngestionState, item: SavedItem, fixture_name: str
+) -> TextReceipt:
+    receipt = await ingestion_state.text_receipt(
+        item.user_id, "instagram", fixture_message(fixture_name)["mid"]
+    )
+    assert receipt is not None
+    return receipt
+
+
+async def test_text_sent_nine_seconds_after_a_reel_is_bound_to_it_and_left_to_the_chat_worker(
     webhooks: AsyncClient,
     session_factory: async_sessionmaker[AsyncSession],
     job_queue: RecordingJobQueue,
+    ingestion_state: RedisIngestionState,
 ) -> None:
     await deliver(webhooks, fixture_body(REEL_BEFORE_HINT))
     await deliver(webhooks, fixture_body(HINT_AFTER_REEL))
 
+    # The webhook calls no model: the chat worker decides (decision record 0018).
     (item,) = await saved_items(session_factory)
-    assert item.collection == "For my movies collection"
-    assert job_queue.named(ANSWER_CHAT_MESSAGE_JOB) == []
+    receipt = await bound_receipt(ingestion_state, item, HINT_AFTER_REEL)
+    assert item.collection is None
+    assert (receipt.route, receipt.saved_item_id) == (TextRoute.UNDECIDED, item.id)
+    assert len(job_queue.named(ANSWER_CHAT_MESSAGE_JOB)) == 1
 
 
 async def test_question_with_no_share_before_it_is_queued_for_the_response_agent(
@@ -254,10 +268,11 @@ async def test_question_long_after_a_share_is_not_taken_as_its_collection_hint(
     assert len(job_queue.named(ANSWER_CHAT_MESSAGE_JOB)) == 1
 
 
-async def test_hint_delivered_after_a_later_share_still_labels_the_reel_sent_before_it(
+async def test_hint_delivered_after_a_later_share_is_still_bound_to_the_reel_sent_before_it(
     webhooks: AsyncClient,
     session_factory: async_sessionmaker[AsyncSession],
     job_queue: RecordingJobQueue,
+    ingestion_state: RedisIngestionState,
 ) -> None:
     hint_event = fixture_json(HINT_AFTER_REEL)["entry"][0]["messaging"][0]
     later_share = fixture_json(REEL_SHARE)
@@ -270,7 +285,8 @@ async def test_hint_delivered_after_a_later_share_still_labels_the_reel_sent_bef
     await deliver(webhooks, fixture_body(HINT_AFTER_REEL))
 
     hinted_reel, later_reel = await saved_items(session_factory)
+    receipt = await bound_receipt(ingestion_state, hinted_reel, HINT_AFTER_REEL)
     assert hinted_reel.source_message_id == fixture_message(REEL_BEFORE_HINT)["mid"]
-    assert hinted_reel.collection == "For my movies collection"
+    assert receipt.saved_item_id == hinted_reel.id
     assert later_reel.collection is None
-    assert job_queue.named(ANSWER_CHAT_MESSAGE_JOB) == []
+    assert len(job_queue.named(ANSWER_CHAT_MESSAGE_JOB)) == 1

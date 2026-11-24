@@ -11,6 +11,7 @@ from app.agent.replies.templates import (
     ReplyWordingUnavailableError,
     ResultLine,
     SavedItemSummary,
+    collection_confirmation,
     confirms_deletion,
     deletion_confirmation,
     deletion_done,
@@ -40,6 +41,8 @@ TURKISH = reply_wording("tr")
 JAPANESE = ReplyWording(
     saved_named="保存しました: {item}",
     saved_as="{category}として保存しました",
+    in_collection="{collection}に",
+    saved_to="{collection}に保存しました",
     streaming_on="{platforms}で配信中",
     which_one="どれを保存しましたか",
     none_of_these="どれでもない",
@@ -118,6 +121,8 @@ def test_empty_language_is_refused(language: str) -> None:
         ("list_separator", ""),
         ("deletion_confirmation", "Reply yes to delete everything."),  # {minutes} missing
         ("deletion_done", "Deleted {minutes} ago"),  # no placeholder allowed here
+        ("saved_to", "Saved"),  # {collection} missing
+        ("in_collection", "in {category}"),  # unknown placeholder
     ],
 )
 def test_supplied_wording_with_wrong_placeholders_or_empty_text_is_refused(
@@ -193,6 +198,38 @@ def test_save_confirmation_with_only_a_name() -> None:
     summary = SavedItemSummary(category="restaurant", name="Kronotrop")
 
     assert save_confirmation(summary, ENGLISH).text == "Saved: Kronotrop"
+
+
+def test_save_confirmation_names_the_collection_the_user_gave_exactly_as_written() -> None:
+    summary = dataclasses.replace(CAR_REVIEW, collection="勉強")
+
+    assert save_confirmation(summary, ENGLISH).text == "Saved as 🚗 car review · BMW M3 · in 勉強"
+    assert save_confirmation(summary, TURKISH).text == (
+        "🚗 car review olarak kaydedildi · BMW M3 · 勉強 koleksiyonunda"
+    )
+    assert (
+        save_confirmation(summary, JAPANESE).text
+        == "🚗 car reviewとして保存しました · BMW M3 · 勉強に"
+    )
+
+
+@pytest.mark.parametrize(
+    ("wording", "text"),
+    [
+        (ENGLISH, "Saved to for my Movies collection"),
+        (TURKISH, "for my Movies collection koleksiyonuna kaydedildi"),
+        (JAPANESE, "for my Movies collectionに保存しました"),
+    ],
+    ids=["en", "tr", "supplied"],
+)
+def test_collection_confirmation_is_one_short_message_in_the_users_language(
+    wording: ReplyWording, text: str
+) -> None:
+    message = collection_confirmation("for my Movies collection", wording)
+
+    assert message.text == text
+    assert message.quick_replies == ()
+    assert message.reply_to_message_id is None
 
 
 # --- which one? ------------------------------------------------------------------------------

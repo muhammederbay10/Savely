@@ -3,20 +3,29 @@
 Each message is handled in two steps:
 
 1. In one database transaction that holds the user's row lock: number the
-   message, store the item or decide the text's route, and write what the job
+   message, store the item or write the text's receipt, and write what the job
    needs to Redis (`app/ingestion/session_state.py`). "Delete my data" takes the same lock,
    so nothing is written for a user while they are being deleted.
 2. After the commit: queue the job. Jobs carry only ids, so a worker never sees
    an item before it is committed, and a job queued for a user who was deleted
    meanwhile holds nothing personal.
 
+**No model call here** (decision record 0018). Every text goes to the chat
+worker. A text sent within `COLLECTION_HINT_WINDOW_SECONDS` after the user's
+last share before it, to an item with no collection yet, gets the route
+`UNDECIDED` with that share's item bound to its receipt; the chat worker asks
+the decision model whether it names a collection (`app.ingestion.text_routing`).
+A tap on one of the bot's buttons is never bound.
+Any other text is `CHAT`. The window is only an upper bound: a later text is
+never a hint and costs no model call.
+
 If queuing fails, the caller reports an error and the platform delivers the
 message again. Every step can be repeated safely:
 
 - a capture finds the item that is already stored, and is queued again only
   while the item is still waiting to be indexed;
-- a text is routed once. Its receipt is kept before anything is changed, and a
-  repeated delivery follows the receipt, also when shares arrived in between;
+- a text's share is bound once. Its receipt is kept before the job is queued,
+  and a repeated delivery follows the receipt, also when shares arrived in between;
 - a chat job is queued again only if its receipt says it was not queued;
 - a job is queued under an id made from the item or the receipt, and the queue
   refuses an id it already knows.
@@ -43,7 +52,6 @@ from app.ingestion.repository import (
     find_or_create_user,
     is_unlabelled_item,
     lock_user,
-    set_collection_if_missing,
     store_capture,
 )
 from app.ingestion.session_state import RedisIngestionState, TextReceipt, TextRoute
@@ -56,7 +64,6 @@ class IngestionOutcome(StrEnum):
 
     ITEM_SAVED = "item_saved"
     ITEM_ALREADY_SAVED = "item_already_saved"
-    COLLECTION_HINT = "collection_hint"
     CHAT_QUEUED = "chat_queued"
     CHAT_ALREADY_QUEUED = "chat_already_queued"
 
@@ -85,7 +92,8 @@ class IngestionService:
             job_queue: Where indexing and chat jobs are queued.
             state: Ingestion's per-user state in Redis.
             collection_hint_window: How long after a share a text from the
-                same user still counts as that item's collection hint.
+                same user may still name that item's collection: the upper
+                bound for asking the decision model.
         """
         self._session_factory = session_factory
         self._job_queue = job_queue
@@ -148,16 +156,15 @@ class IngestionService:
         return _log_capture(event, stored)
 
     async def ingest_chat_message(self, message: ChatMessage) -> IngestionOutcome:
-        """Attach a text to the share just before it as a collection hint, or queue it as chat.
+        """Bind a text to the share just before it, if it may name its collection, and queue it.
 
-        A text seen before follows its receipt and is not routed again.
+        A text seen before follows its receipt and is not bound again.
 
         Args:
             message: The chat message.
 
         Returns:
-            Whether the text became a collection hint or a chat job, and
-            whether that chat job was already queued.
+            Whether the text's chat job was queued now or already before.
 
         Raises:
             UnknownUserError: If the user was deleted meanwhile.
@@ -171,18 +178,14 @@ class IngestionService:
             )
             if receipt is None:
                 receipt = await self._route_new_text(session, message)
-            if receipt.route is TextRoute.CHAT:
-                if not receipt.chat_queued:
-                    await self._state.save_chat_payload(message.user_id, receipt.id, message)
-            elif receipt.saved_item_id is not None:
-                await set_collection_if_missing(
-                    session, message.user_id, receipt.saved_item_id, message.text
-                )
-        outcome = await self._finish_route(message, receipt)
+            if not receipt.chat_queued:
+                await self._state.save_chat_payload(message.user_id, receipt.id, message)
+        outcome = await self._queue_chat(message, receipt)
         logger.info(
             "chat_message_ingested",
             extra={
                 "outcome": outcome,
+                "route": receipt.route,
                 "user_id": str(message.user_id),
                 "platform": message.platform,
             },
@@ -196,11 +199,11 @@ class IngestionService:
             number=await self._state.number_message(
                 message.user_id, message.platform, message.message_id
             ),
-            route=TextRoute.CHAT if hinted_item_id is None else TextRoute.COLLECTION_HINT,
+            route=TextRoute.CHAT if hinted_item_id is None else TextRoute.UNDECIDED,
             saved_item_id=hinted_item_id,
             chat_queued=False,
         )
-        # Kept before the item is changed, so a repeated delivery is routed the same way.
+        # Kept before the job is queued, so a repeated delivery is bound the same way.
         await self._state.save_text_receipt(
             message.user_id, message.platform, message.message_id, receipt
         )
@@ -209,6 +212,9 @@ class IngestionService:
     async def _item_awaiting_hint(
         self, session: AsyncSession, message: ChatMessage
     ) -> uuid.UUID | None:
+        if message.quick_reply_payload is not None:
+            # A tap on one of the bot's buttons answers the bot; it never names a collection.
+            return None
         # The last share sent before the text, even if later shares arrived first.
         share = await self._state.latest_share_between(
             message.user_id,
@@ -222,9 +228,7 @@ class IngestionService:
             return None
         return share.saved_item_id
 
-    async def _finish_route(self, message: ChatMessage, receipt: TextReceipt) -> IngestionOutcome:
-        if receipt.route is TextRoute.COLLECTION_HINT:
-            return IngestionOutcome.COLLECTION_HINT
+    async def _queue_chat(self, message: ChatMessage, receipt: TextReceipt) -> IngestionOutcome:
         if receipt.chat_queued:
             return IngestionOutcome.CHAT_ALREADY_QUEUED
         await self._job_queue.enqueue(
@@ -232,19 +236,26 @@ class IngestionService:
             chat_job_id(receipt.id),
             {"user_id": str(message.user_id), "message_receipt_id": str(receipt.id)},
         )
-        await self._mark_chat_queued(message, receipt)
+        await self._mark_chat_queued(message)
         return IngestionOutcome.CHAT_QUEUED
 
-    async def _mark_chat_queued(self, message: ChatMessage, receipt: TextReceipt) -> None:
+    async def _mark_chat_queued(self, message: ChatMessage) -> None:
         async with self._session_factory.begin() as session:
             # A user deleted since the job was queued keeps no receipt.
-            if await lock_user(session, message.user_id):
-                await self._state.save_text_receipt(
-                    message.user_id,
-                    message.platform,
-                    message.message_id,
-                    receipt.model_copy(update={"chat_queued": True}),
-                )
+            if not await lock_user(session, message.user_id):
+                return
+            # Read again under the lock: the chat job may have decided the route meanwhile.
+            receipt = await self._state.text_receipt(
+                message.user_id, message.platform, message.message_id
+            )
+            if receipt is None or receipt.chat_queued:
+                return
+            await self._state.save_text_receipt(
+                message.user_id,
+                message.platform,
+                message.message_id,
+                receipt.model_copy(update={"chat_queued": True}),
+            )
 
 
 async def _require_user(session: AsyncSession, user_id: uuid.UUID) -> None:

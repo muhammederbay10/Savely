@@ -555,13 +555,24 @@ class ItemIndexer:
     async def _confirm(self, run: _Run, event: CaptureEvent, category: str) -> None:
         if run.resume(Step.CONFIRM) is not None:
             return
-        async with self._sessions() as session:
+        async with self._locked(run) as (session, item):
             recipient = await recipient_of(session, run.user_id, event.platform)
             language = await language_of(session, run.user_id)
+            collection = item.collection
+            # Read and marked under the owner's row lock: a collection the chat
+            # worker sets after this is confirmed by its own message (record 0018).
+            await record_step(
+                session,
+                run.item_id,
+                Step.CONFIRM,
+                RunStatus.STARTED,
+                output={"collection_included": collection is not None},
+            )
         confirmation = await self._steps.confirmer.confirm(
             recipient_id=recipient,
             language=language,
             category=category,
+            collection=collection,
             last_user_message_at=event.received_at,
         )
         try:
@@ -571,7 +582,10 @@ class ItemIndexer:
                     run.item_id,
                     Step.CONFIRM,
                     _CONFIRMATION_RUN_STATUS[confirmation.status],
-                    output=confirmation.to_output(),
+                    output={
+                        **confirmation.to_output(),
+                        "collection_included": collection is not None,
+                    },
                 )
         except _ItemGoneError:
             return
