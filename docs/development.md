@@ -465,7 +465,7 @@ Each test id names the question and the run (`[en-What did i save?-2]`), so the 
 
 ### Live routing check
 
-`tests/live/test_collection_routing_live.py` checks that the **real decision model** tells collection names from questions when they are sent right after a share (SAV-39, decision record 0018). It asks the production question (`ROUTING_PROMPTS`) about 24 synthetic texts in English, Turkish, Spanish and Japanese, half collection names ("Food", "Filmler", "para mi colección de viajes", "勉強") and half questions or small talk ("What did i save?", "bu nerede?", "hola", "ありがとう"), and compares each probability with your `COLLECTION_HINT_MIN_PROBABILITY`. It needs no database. A run costs a fraction of a cent.
+`tests/live/test_collection_routing_live.py` checks that the **real decision model** tells collection names from questions when they are sent right after a share (SAV-39, decision record 0018). It asks the production question (`ROUTING_PROMPTS`) about 28 synthetic texts in English, Turkish, Spanish and Japanese, half collection names ("Food", "Recipes to try", "Filmler", "para mi colección de viajes", "勉強") and half questions or small talk ("What did i save?", "restaurants in Kadıköy", "kaydettiğim tatlıcılar", "bu nerede?", "hola", "ありがとう"), and compares each probability with your `COLLECTION_HINT_MIN_PROBABILITY`. Short phrases that ask about saved things without a question mark are questions; short list names are collections. The new Spanish and Japanese pairs of that kind ("cafeterías en Malasaña" / "Cenas fáciles", "保存したラーメン屋" / "行きたいカフェ") are not quoted in the prompt, so they show whether it generalizes. It needs no database. A run costs a fraction of a cent.
 
 Like the response agent check, it is opt-in, never runs in CI (it is skipped whenever `CI` is set, before any client is built; `tests/live/test_collection_routing_live_gate.py` checks this offline) and is skipped without the live switch and the key. The owner runs it locally, never in an agent's worktree. **Run it in the same session as SAV-38's check**, in the main checkout (the one with `.env`) at the SAV-39 head, which already contains SAV-38's head:
 
@@ -478,7 +478,7 @@ LIVE_MODEL_TESTS=1 TEST_DATABASE_ADMIN_URL=postgresql+asyncpg://savely:change-me
   -v --log-cli-level=INFO
 ```
 
-Each test id names the language, the expected route and the text (`[ja-question-ありがとう]`), so the passed cases out of 24 are the accuracy. With `--log-cli-level=INFO` every case logs a `routing_case` line with its probability, which shows how close each text is to the threshold. A wrong route fails with, for example, `wrong route: language=en expected=question routed=collection probability=0.81 threshold=0.7 prompts=2026-11-24.1`.
+Each test id names the language, the expected route and the text (`[ja-question-ありがとう]`), so the passed cases out of 28 are the accuracy. Report it per language, and every question stored as a collection: that is the harmful mistake. With `--log-cli-level=INFO` every case logs a `routing_case` line with its probability, which shows how close each text is to the threshold. A wrong route fails with, for example, `wrong route: language=en expected=question routed=collection probability=0.83 threshold=0.8 prompts=2026-11-25.1`.
 
 Post on SAV-39: the tested SHA (and SAV-38's head it contains), the decision model and endpoint (`DECISION_MODEL`, `OPENROUTER_DECISIONS_URL`), the threshold, the accuracy overall and per language, and every wrong route with its probability. Post SAV-38's results on SAV-38.
 
@@ -724,7 +724,7 @@ Every step can be repeated without doubling anything. If a store stays down, the
 | `CHAT_RUN_DEADLINE_SECONDS` | How long one try may take to prepare an answer; sending is not cut off |
 | `CHAT_JOB_TIMEOUT_SECONDS` | arq's own limit on one try; longer than the run deadline, only a backstop |
 | `COLLECTION_HINT_DECISION_TIMEOUT_SECONDS` | How long that decision may take, the decision model's retries included, before the text is answered as chat. At most half of `CHAT_RUN_DEADLINE_SECONDS`; `10` in `.env.example`. **New in SAV-39: add it to your `.env`** |
-| `COLLECTION_HINT_MIN_PROBABILITY` | How sure the decision model must be, above 0 and at most 1, that a text right after a share names its collection; below it the text is answered. `0.7` in `.env.example`, to be tuned on the [live routing check](#live-routing-check). **New in SAV-39: add it to your `.env`, or the chat worker won't start** |
+| `COLLECTION_HINT_MIN_PROBABILITY` | How sure the decision model must be, above 0 and at most 1, that a text right after a share names its collection; below it the text is answered. `0.8` in `.env.example`, the owner's choice from the first [live routing check](#live-routing-check) (25 Nov 2026). **New in SAV-39: add it to your `.env`, or the chat worker won't start** |
 
 They are read through `ChatSettings` in [`app/config/chat.py`](../app/config/chat.py), with `get_chat_settings()`. The log lines (`text_route_decided`, `text_route_decision_failed`, `text_route_decision_timed_out`, `collection_confirmation_failed`, `chat_answer_retry`, `chat_answer_failed`, `chat_answer_send_failed`, `chat_exchange_store_failed`, `chat_exchange_not_stored`, `user_profile_updated`) hold error class names and field names only, never a message, a place or an id.
 

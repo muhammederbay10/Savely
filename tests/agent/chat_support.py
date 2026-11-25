@@ -52,7 +52,7 @@ from tests.agent.support import RecordingSendApi, build_messenger, sent
 from tests.db_factories import INSTAGRAM
 
 HINT_WINDOW = timedelta(seconds=30)
-HINT_MIN_PROBABILITY = 0.7
+HINT_MIN_PROBABILITY = 0.8
 ROUTING_TIMEOUT_SECONDS = 5.0
 SESSION_LIFETIME = timedelta(hours=24)
 HISTORY_MESSAGES = 20
@@ -224,6 +224,7 @@ def build_chat(
     routing_model: Classifier | None = None,
     routing_sessions: async_sessionmaker[AsyncSession] | None = None,
     routing_timeout_seconds: float = ROUTING_TIMEOUT_SECONDS,
+    routing_min_probability: float = HINT_MIN_PROBABILITY,
     run_deadline_seconds: float = RUN_DEADLINE_SECONDS,
     **agent_settings: int,
 ) -> ChatUnderTest:
@@ -250,7 +251,7 @@ def build_chat(
             stores.state,
             routing_model or FakeClassifier(),
             ROUTING_PROMPTS,
-            min_probability=HINT_MIN_PROBABILITY,
+            min_probability=routing_min_probability,
             decision_timeout_seconds=routing_timeout_seconds,
         ),
         memory=stores.memory,

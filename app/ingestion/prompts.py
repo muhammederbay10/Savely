@@ -27,7 +27,7 @@ class RoutingPrompts:
     """Everything text routing says to the decision model.
 
     Attributes:
-        version: Names this wording, e.g. `2026-11-24.1`.
+        version: Names this wording, e.g. `2026-11-25.1`.
         collection_name_question: The yes/no question: does the text only name
             a collection to file the just-shared post in?
         collection_name_input: The text as the decision model reads it; `{text}`.
@@ -74,14 +74,24 @@ def _placeholders(field_name: str, template: str) -> frozenset[str]:
 # language, and the code holds no word lists (decision record 0005). Change the
 # version with any change to the wording, and run the live routing check
 # (docs/development.md) before and after.
+#
+# 2026-11-25.1 (owner's decision on SAV-39, 25 Nov 2026): the first live check stored two
+# short phrases that ask about saved things ("restaurants in Kadıköy", "kaydettiğim
+# tatlıcılar") as collections. The question now says that a phrase asking for or
+# describing saved things is a question even without a question mark, and that a short
+# list name ("Recipes to try") is a collection.
 ROUTING_PROMPTS: Final = RoutingPrompts(
-    version="2026-11-24.1",
+    version="2026-11-25.1",
     collection_name_question=(
         "The user just shared a post with a bot that keeps their saved posts, and then sent "
         "this message. Is the message only the name of a collection, folder or list to file "
-        "that post in, in any language (for example 'Food', 'for my Movies collection', "
-        "'Filmler', '勉強')? Answer no for a question, a request, a greeting, a comment about "
-        "the post or anything else that expects a reply."
+        "that one post in, in any language (for example 'Food', 'Recipes to try', 'for my "
+        "Movies collection', 'Filmler', '映画リスト')? A short list name like these is a "
+        "collection name, even when it says what the list is for. Answer no when the message "
+        "asks for, searches for or describes things the user has saved, such as "
+        "'the dessert shops I saved' or 'restaurants in <a place>': that is a question, even "
+        "as a short phrase with no question mark. Also answer no for a request, a greeting, a "
+        "comment about the post or anything else that expects a reply."
     ),
     collection_name_input="Message sent right after sharing a post: {text}",
 )

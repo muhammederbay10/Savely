@@ -5,9 +5,14 @@ that reel's collection, because the route was decided by time alone. Now the
 decision model decides (decision record 0018). The unit tests use a fake
 model, so they can't tell whether the real one tells collection names from
 questions. This check asks the configured decision model the production
-question (`ROUTING_PROMPTS`) about 24 texts in four languages, half
+question (`ROUTING_PROMPTS`) about 28 texts in four languages, half
 collection names and half questions or small talk, and compares its
-probability with the configured `COLLECTION_HINT_MIN_PROBABILITY`.
+probability with the configured `COLLECTION_HINT_MIN_PROBABILITY`. The set
+includes short phrases that ask about saved things without a question mark
+("restaurants in Kadıköy"), which the first live check stored as
+collections, and short list names ("Recipes to try"). The Spanish and
+Japanese pairs of that kind are not quoted in the prompt, so they show
+whether the wording generalizes.
 
 What is real: the decision model, the wording and the threshold, from the
 same settings as production. Nothing else runs: no database, no chat worker.
@@ -81,6 +86,8 @@ CASES = [
     ("es", QUESTION, "¿qué restaurantes guardé?"),
     ("es", QUESTION, "¿dónde está este lugar?"),
     ("es", QUESTION, "hola"),
+    ("es", COLLECTION, "Cenas fáciles"),
+    ("es", QUESTION, "cafeterías en Malasaña"),
     ("ja", COLLECTION, "勉強"),
     ("ja", COLLECTION, "旅行"),
     ("ja", COLLECTION, "映画リスト"),
@@ -88,6 +95,8 @@ CASES = [
     ("ja", QUESTION, "保存した映画は\uff1f"),
     ("ja", QUESTION, "これはどこ\uff1f"),
     ("ja", QUESTION, "ありがとう"),
+    ("ja", COLLECTION, "行きたいカフェ"),
+    ("ja", QUESTION, "保存したラーメン屋"),
 ]
 
 

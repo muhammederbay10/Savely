@@ -12,6 +12,7 @@ import uuid
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 from sqlalchemy import select, update
@@ -545,3 +546,62 @@ async def test_a_label_whose_indexing_fails_afterwards_is_left_to_the_indexer_on
     assert (first, again) == (ChatOutcome.COLLECTION_HINT, ChatOutcome.COLLECTION_HINT)
     assert chat.sent_texts() == []
     assert len(model.calls) == 1
+
+
+# --- The owner's threshold, on the first live check's probabilities (25 Nov 2026) --------
+
+ENV_EXAMPLE_PATH = Path(__file__).resolve().parents[2] / ".env.example"
+THRESHOLD_SETTING = "COLLECTION_HINT_MIN_PROBABILITY"
+# What the real decision model answered in the first live routing check (SAV-39, prompts
+# 2026-11-24.1). At 0.7 these two questions were stored as collections and got no answer.
+RECORDED_QUESTIONS = [("restaurants in Kadıköy", 0.72), ("kaydettiğim tatlıcılar", 0.76)]
+# The lowest-scored collection name that must still be stored at the owner's threshold.
+RECORDED_COLLECTION = ("tatil listem için", 0.81)
+
+
+def configured_threshold() -> float:
+    """The threshold `.env.example` sets, which the owner chose from the live results."""
+    for line in ENV_EXAMPLE_PATH.read_text().splitlines():
+        name, _, value = line.partition("=")
+        if name == THRESHOLD_SETTING:
+            return float(value)
+    raise AssertionError(f"{THRESHOLD_SETTING} is missing from .env.example")
+
+
+@pytest.mark.parametrize(("text", "probability"), RECORDED_QUESTIONS)
+async def test_a_short_phrase_question_scored_like_the_live_check_is_answered(
+    chat_stores: ChatStores, text: str, probability: float
+) -> None:
+    user_id = await chat_stores.new_user(SENDER_ID)
+    chat = build_chat(
+        chat_stores,
+        [final_answer("en", "Here you go.")],
+        routing_model=routing_model(YesNoAnswer(probability_yes=probability, confidence=None)),
+        routing_min_probability=configured_threshold(),
+    )
+    share, receipt = await text_right_after(chat_stores, user_id, text)
+
+    outcome = await chat.responder.respond(user_id, receipt, last_try=False)
+
+    assert outcome is ChatOutcome.ANSWERED
+    assert chat.sent_texts() == ["Here you go."]
+    assert (await item_of(chat_stores, share)).collection is None
+
+
+async def test_a_list_name_scored_like_the_live_check_is_still_stored(
+    chat_stores: ChatStores,
+) -> None:
+    text, probability = RECORDED_COLLECTION
+    user_id = await chat_stores.new_user(SENDER_ID)
+    chat = build_chat(
+        chat_stores,
+        [],
+        routing_model=routing_model(YesNoAnswer(probability_yes=probability, confidence=None)),
+        routing_min_probability=configured_threshold(),
+    )
+    share, receipt = await text_right_after(chat_stores, user_id, text)
+
+    outcome = await chat.responder.respond(user_id, receipt, last_try=False)
+
+    assert outcome is ChatOutcome.COLLECTION_HINT
+    assert (await item_of(chat_stores, share)).collection == text

@@ -136,6 +136,21 @@ def test_a_local_opt_in_with_a_key_may_run(ci: str | None) -> None:
     assert live_run_blocker(environ) is None
 
 
+# Texts the owner asked the set to keep after the first live check (SAV-39, 25 Nov 2026).
+REQUIRED_CASES = [
+    ("en", "question", "restaurants in Kadıköy"),
+    ("tr", "question", "kaydettiğim tatlıcılar"),
+    ("en", "collection", "Recipes to try"),
+]
+
+
+def test_every_language_is_half_collection_names_and_keeps_the_owners_cases() -> None:
+    for language in {case[0] for case in CASES}:
+        routes = [route for case_language, route, _ in CASES if case_language == language]
+        assert routes.count(COLLECTION) * 2 == len(routes), language
+    assert [case for case in REQUIRED_CASES if case not in CASES] == []
+
+
 def test_the_cases_are_half_collection_names_in_enough_languages() -> None:
     names = [case for case in CASES if case[1] == COLLECTION]
 

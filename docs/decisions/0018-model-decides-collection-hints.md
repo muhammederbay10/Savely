@@ -1,7 +1,7 @@
 # 0018: The decision model decides whether a text after a share is a collection name
 
 - Status: accepted. Muhammed dropped the time-only rule by creating SAV-39 (24 Nov 2026) and approved the three proposal points (worker-side routing, the window as an upper bound with unsure or failed decisions going to chat, and the confirmations) on SAV-39 the same day.
-- Date: 2026-11-24, revised the same day after the first review (points 2 and 4: the decision timeout, labels adopted from an overlapping try, failed indexing) the second (point 4: the failure confirmation never outlives "delete my data") and the third (point 4: its hold doesn't block the webhook)
+- Date: 2026-11-24, revised the same day after the first review (points 2 and 4: the decision timeout, labels adopted from an overlapping try, failed indexing), the second (point 4: the failure confirmation never outlives "delete my data") and the third (point 4: its hold doesn't block the webhook); revised on 2026-11-25 with the first live check and the owner's decisions (points 6 and 7)
 - Ticket: SAV-39. Supersedes the time-only hint rule of record 0002 (consequence on hints) and record 0009 (point 7, "Route", and Q1). Everything else in 0009 point 7 stays: the share history by send time, one receipt per text, one item per hint.
 
 ## Context
@@ -27,7 +27,12 @@ The webhook must answer Meta fast and calls no model (ARCHITECTURE §3.2), and a
    - The collection confirmation is sent once: the reply mark is written right before sending (`SessionMemory.start_reply`), so a later try sends nothing, and a failed send is not tried again.
    - A hint is not part of the conversation the response agent reads, as before.
 5. **"Delete my data"** takes the same user row lock. A user deleted before the job runs has no payload or receipt left: the job stops with no model call. Every text's receipt names its chat job, so the eraser removes every queued job of the user, whatever its route.
-6. **New settings** (chat worker, `ChatSettings`): `COLLECTION_HINT_MIN_PROBABILITY`, from 0 (excluded) to 1, 0.7 in `.env.example`, to be tuned on the live routing check; and `COLLECTION_HINT_DECISION_TIMEOUT_SECONDS`, at most half of `CHAT_RUN_DEADLINE_SECONDS`, 10 in `.env.example`.
+6. **New settings** (chat worker, `ChatSettings`): `COLLECTION_HINT_MIN_PROBABILITY`, from 0 (excluded) to 1, 0.8 in `.env.example`; and `COLLECTION_HINT_DECISION_TIMEOUT_SECONDS`, at most half of `CHAT_RUN_DEADLINE_SECONDS`, 10 in `.env.example`.
+7. **First live check and the owner's decisions (25 Nov 2026).** At `cce6839f`, with `google/gemini-decision-1`, threshold 0.7 and prompts `2026-11-24.1`, the check scored 21 of 24 (en 4/6, tr 5/6, es 6/6, ja 6/6). Two short phrases that ask about saved things without a question mark were stored as collections: "restaurants in Kadıköy" (0.72) and "kaydettiğim tatlıcılar" (0.76); "Recipes to try" (0.69) went to chat. Muhammed decided:
+   - the threshold is **0.8**, above every question's probability in that run, so the remaining mistakes are the safe kind (a label goes to chat);
+   - the prompt (`2026-11-25.1`) says, in words that hold for any language, that a phrase asking for or describing saved things is a question even without a question mark, and that a short list name is a collection;
+   - the live set adds such pairs in Spanish and Japanese that the prompt doesn't quote (28 cases);
+   - the 10-second decision timeout and the English fallback for a user whose language is unknown stay.
 
 ## Alternatives considered
 
@@ -43,5 +48,5 @@ The webhook must answer Meta fast and calls no model (ARCHITECTURE §3.2), and a
 - A collection name is confirmed: in the save confirmation when it was not sent yet, otherwise in one extra short message.
 - The receipt has a new route (`undecided`) and a new field (`confirm_collection`, default `false`); receipts written before this change still load. `IngestionOutcome.COLLECTION_HINT` is gone: the webhook only reports `chat_queued` or `chat_already_queued`, and logs the route. The chat worker logs `text_route_decided` with the route, the reason, the probability and the prompts version, never the text.
 - The confirm step of `enrichment_run` has a new status, `started`, written before the confirmation is sent. A confirm step that only confirmed the collection of a failed item has `after_failure: true` in its output.
-- Model behaviour changed, so SAV-22's opt-in live check applies: `tests/live/test_collection_routing_live.py` asks the real decision model about 24 texts in four languages, half collection names. Muhammed runs it locally with SAV-38's check (`docs/development.md`, "Live routing check").
+- Model behaviour changed, so SAV-22's opt-in live check applies: `tests/live/test_collection_routing_live.py` asks the real decision model about 28 texts in four languages, half collection names. Muhammed runs it locally with SAV-38's check (`docs/development.md`, "Live routing check").
 - `docs/ARCHITECTURE.md` §3.1–3.2, `docs/development.md` and `.env.example` describe the new route.

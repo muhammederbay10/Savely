@@ -15,7 +15,7 @@ CHAT_ENVIRONMENT = {
     "CHAT_RETRY_DELAY_SECONDS": "5",
     "CHAT_RUN_DEADLINE_SECONDS": "60",
     "CHAT_JOB_TIMEOUT_SECONDS": "180",
-    "COLLECTION_HINT_MIN_PROBABILITY": "0.7",
+    "COLLECTION_HINT_MIN_PROBABILITY": "0.8",
     "COLLECTION_HINT_DECISION_TIMEOUT_SECONDS": "10",
 }
 
@@ -43,7 +43,7 @@ def test_chat_settings_are_read_from_environment_variables(
     assert settings.chat_retry_delay_seconds == 5
     assert settings.chat_run_deadline_seconds == 60
     assert settings.chat_job_timeout_seconds == 180
-    assert settings.collection_hint_min_probability == 0.7
+    assert settings.collection_hint_min_probability == 0.8
     assert settings.collection_hint_decision_timeout_seconds == 10
 
 
