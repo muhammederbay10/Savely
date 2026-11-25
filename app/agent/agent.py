@@ -43,9 +43,11 @@ message: no model call, translation or other tool runs after the erasure.
 answer format says so (`maxItems`), and so does the prompt, so the answer stays
 short. The code never relies on it: only the first that many are shown. The
 rest are kept in order for "show more" (`AgentAnswer.more_item_ids`): first the
-items the answer listed beyond the cap, then this turn's search results the
-answer did not show; when the answer continues the last results without a new
-search ("show more"), the last results not shown yet. Each shown item becomes
+items the answer listed beyond the cap, then the unshown results of the
+searches the answer presents. Each shown item belongs to the latest search that
+returned it, so a broad search that a narrower one replaced adds nothing. When
+the answer continues the last results without a new search ("show more"), the
+last results not shown yet. Each shown item becomes
 a reply quoting the saved post (`app/agent/replies/answers.py`, decision
 record 0004).
 
@@ -298,8 +300,8 @@ class _Turn:
     # The last results the user has not seen yet, in order, for "show more".
     previous_unshown: tuple[uuid.UUID, ...]
     searches: list[SearchUsed] = field(default_factory=list)
-    # This turn's search results, in the order the searches returned them.
-    found: dict[uuid.UUID, None] = field(default_factory=dict)
+    # Each of this turn's searches' results, in call order, each in its own order.
+    search_results: list[tuple[uuid.UUID, ...]] = field(default_factory=list)
     notices: set[Notice] = field(default_factory=set)
     availability_gaps: dict[tuple[uuid.UUID, str], AvailabilityGap] = field(default_factory=dict)
     asks_deletion_confirmation: bool = False
@@ -507,7 +509,7 @@ class ResponseAgent:
             state.asks_deletion_confirmation |= outcome.asks_deletion_confirmation
             if outcome.search is not None:
                 state.searches.append(outcome.search)
-                state.found.update(dict.fromkeys(outcome.offered_item_ids))
+                state.search_results.append(outcome.offered_item_ids)
             messages.append(
                 Message(role="tool", content=outcome.as_json(), tool_call_id=tool_call.id)
             )
@@ -621,20 +623,43 @@ def _more_item_ids(
     """Return the results kept for "show more", in order; none when nothing is shown.
 
     First the items the answer listed beyond the cap, then the results it did
-    not show: this turn's search results, or, when the answer continues the
-    last results without a new search, the last results not shown yet.
+    not show: those of the searches the answer presents (`_presented_results`),
+    or, when the answer continues the last results without a new search, the
+    last results not shown yet.
     """
     if not shown:
         return ()
     shown_ids = [card.item_id for card in shown]
-    if state.searches:
-        pool: Sequence[uuid.UUID] = tuple(state.found)
-    elif set(shown_ids) <= set(state.previous_unshown):
+    pool: Sequence[uuid.UUID] = _presented_results(shown_ids, state.search_results)
+    if not pool and set(shown_ids) <= set(state.previous_unshown):
         pool = state.previous_unshown
-    else:
-        pool = ()
     candidates = [card.item_id for card in listed_beyond_cap] + list(pool)
     return tuple(item_id for item_id in dict.fromkeys(candidates) if item_id not in shown_ids)
+
+
+def _presented_results(
+    shown_ids: Sequence[uuid.UUID], search_results: Sequence[tuple[uuid.UUID, ...]]
+) -> tuple[uuid.UUID, ...]:
+    """Return the results of the searches the answer presents, in call order.
+
+    Each shown item belongs to the latest search that returned it, so a broad
+    search that a narrower one replaced ("everything", then "restaurants")
+    adds nothing; an answer drawn from two searches keeps both.
+    """
+    presented: set[int] = set()
+    for item_id in shown_ids:
+        latest = next(
+            (
+                index
+                for index in reversed(range(len(search_results)))
+                if item_id in search_results[index]
+            ),
+            None,
+        )
+        if latest is not None:
+            presented.add(latest)
+    ordered = (item_id for index in sorted(presented) for item_id in search_results[index])
+    return tuple(dict.fromkeys(ordered))
 
 
 def _json_or_none(text: str) -> object:

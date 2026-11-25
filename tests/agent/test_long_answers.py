@@ -248,3 +248,70 @@ async def test_an_answer_about_one_of_the_last_results_adds_no_others(
 
     assert shown_ids(answer.messages.results) == last_results[:1]
     assert answer.more_item_ids == ()
+
+
+async def test_a_narrower_search_replaces_a_broad_one_for_show_more(
+    session_factory: async_sessionmaker[AsyncSession], saves: Saves
+) -> None:
+    """Reviewer's case: the broad search's hits must not page into the restaurant results."""
+    kimchi, diner = saves.ids("kimchi", "diner")
+    unrelated = saves.ids("car", "integrals", "izakaya")
+    under_test = build_agent(
+        session_factory,
+        [
+            SEARCH_EVERYTHING,
+            tool_calls((SEARCH_ITEMS_TOOL, {"category": "restaurant"})),
+            final_answer("en", "One restaurant; ask for more.", [kimchi]),
+            # "show more": the model tries an unrelated item, then lists what is allowed.
+            final_answer("en", "The next ones:", [diner, *unrelated]),
+            final_answer("en", "The next one:", [diner]),
+        ],
+    )
+
+    first = await under_test.agent.answer(turn(saves, "restaurants"))
+
+    restaurant_search = tool_results(under_test.generator.requests[2])[-1]
+    restaurants = [uuid.UUID(str(result["item_id"])) for result in restaurant_search["results"]]  # type: ignore[union-attr]
+    assert set(restaurants) == {kimchi, diner}
+    assert first.more_item_ids == (diner,)
+    assert not set(unrelated) & set(first.working_set)
+
+    second = await under_test.agent.answer(
+        turn(
+            saves,
+            "show more",
+            working_set=first.working_set,
+            working_set_shown=len(first.messages.results),
+            working_set_searches=first.searches,
+        )
+    )
+
+    assert shown_ids(second.messages.results) == [diner]
+    assert second.more_item_ids == ()
+
+
+async def test_an_answer_from_two_searches_keeps_both_searches_unshown_results(
+    session_factory: async_sessionmaker[AsyncSession], saves: Saves
+) -> None:
+    kronotrop, hereditary = saves.ids("kronotrop", "hereditary")
+    under_test = build_agent(
+        session_factory,
+        [
+            tool_calls(
+                (SEARCH_ITEMS_TOOL, {"type": "place"}),
+                (SEARCH_ITEMS_TOOL, {"type": "movie"}),
+            ),
+            final_answer("en", "A place and a movie:", [kronotrop, hereditary]),
+        ],
+    )
+
+    answer = await under_test.agent.answer(turn(saves, "places and movies I saved"))
+
+    places, movies = (
+        [uuid.UUID(str(result["item_id"])) for result in search["results"]]  # type: ignore[union-attr]
+        for search in tool_results(under_test.generator.requests[1])
+    )
+    shown = {kronotrop, hereditary}
+    expected = [item_id for item_id in [*places, *movies] if item_id not in shown]
+    assert expected
+    assert list(answer.more_item_ids) == expected
