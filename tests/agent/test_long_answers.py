@@ -315,3 +315,36 @@ async def test_an_answer_from_two_searches_keeps_both_searches_unshown_results(
     expected = [item_id for item_id in [*places, *movies] if item_id not in shown]
     assert expected
     assert list(answer.more_item_ids) == expected
+
+
+async def test_a_search_shown_only_beyond_the_cap_keeps_its_other_results(
+    session_factory: async_sessionmaker[AsyncSession], saves: Saves
+) -> None:
+    """Reviewer's case: with a cap of 1, the movie search is only beyond the cap."""
+    kronotrop, hereditary, conjuring, inception = saves.ids(
+        "kronotrop", "hereditary", "conjuring", "inception"
+    )
+    under_test = build_agent(
+        session_factory,
+        [
+            tool_calls(
+                (SEARCH_ITEMS_TOOL, {"type": "place"}),
+                (SEARCH_ITEMS_TOOL, {"type": "movie"}),
+            ),
+            final_answer("en", "A place and a movie:", [kronotrop, hereditary]),
+        ],
+        agent_max_results_per_answer=1,
+    )
+
+    answer = await under_test.agent.answer(turn(saves, "places and movies I saved"))
+
+    places, movies = (
+        [uuid.UUID(str(result["item_id"])) for result in search["results"]]  # type: ignore[union-attr]
+        for search in tool_results(under_test.generator.requests[1])
+    )
+    assert {conjuring, inception} < set(movies)
+    assert shown_ids(answer.messages.results) == [kronotrop]
+    # Listed beyond the cap first, then the places' and the movies' other results, in order.
+    other_places = [item_id for item_id in places if item_id != kronotrop]
+    other_movies = [item_id for item_id in movies if item_id != hereditary]
+    assert list(answer.more_item_ids) == [hereditary, *other_places, *other_movies]

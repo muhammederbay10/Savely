@@ -44,12 +44,12 @@ answer format says so (`maxItems`), and so does the prompt, so the answer stays
 short. The code never relies on it: only the first that many are shown. The
 rest are kept in order for "show more" (`AgentAnswer.more_item_ids`): first the
 items the answer listed beyond the cap, then the unshown results of the
-searches the answer presents. Each shown item belongs to the latest search that
-returned it, so a broad search that a narrower one replaced adds nothing. When
-the answer continues the last results without a new search ("show more"), the
-last results not shown yet. Each shown item becomes
-a reply quoting the saved post (`app/agent/replies/answers.py`, decision
-record 0004).
+searches the answer presents. Each item the answer lists, beyond the cap too,
+belongs to the latest search that returned it, so a broad search that a
+narrower one replaced adds nothing. When the answer continues the last results
+without a new search ("show more"), the last results not shown yet. Each shown
+item becomes a reply quoting the saved post (`app/agent/replies/answers.py`,
+decision record 0004).
 
 **Working set.** "Mark the second one as watched" needs the results the user
 saw last. The caller passes them in `AgentTurn.working_set`, in the order they
@@ -623,31 +623,33 @@ def _more_item_ids(
     """Return the results kept for "show more", in order; none when nothing is shown.
 
     First the items the answer listed beyond the cap, then the results it did
-    not show: those of the searches the answer presents (`_presented_results`),
-    or, when the answer continues the last results without a new search, the
-    last results not shown yet.
+    not show: those of the searches the answer presents, judged by every item
+    it listed, beyond the cap too (`_presented_results`); or, when the answer
+    continues the last results without a new search, the last results not
+    shown yet.
     """
     if not shown:
         return ()
     shown_ids = [card.item_id for card in shown]
-    pool: Sequence[uuid.UUID] = _presented_results(shown_ids, state.search_results)
+    beyond_cap_ids = [card.item_id for card in listed_beyond_cap]
+    pool: Sequence[uuid.UUID] = _presented_results(shown_ids + beyond_cap_ids, state.search_results)
     if not pool and set(shown_ids) <= set(state.previous_unshown):
         pool = state.previous_unshown
-    candidates = [card.item_id for card in listed_beyond_cap] + list(pool)
+    candidates = beyond_cap_ids + list(pool)
     return tuple(item_id for item_id in dict.fromkeys(candidates) if item_id not in shown_ids)
 
 
 def _presented_results(
-    shown_ids: Sequence[uuid.UUID], search_results: Sequence[tuple[uuid.UUID, ...]]
+    listed_ids: Sequence[uuid.UUID], search_results: Sequence[tuple[uuid.UUID, ...]]
 ) -> tuple[uuid.UUID, ...]:
     """Return the results of the searches the answer presents, in call order.
 
-    Each shown item belongs to the latest search that returned it, so a broad
+    Each listed item belongs to the latest search that returned it, so a broad
     search that a narrower one replaced ("everything", then "restaurants")
     adds nothing; an answer drawn from two searches keeps both.
     """
     presented: set[int] = set()
-    for item_id in shown_ids:
+    for item_id in listed_ids:
         latest = next(
             (
                 index
