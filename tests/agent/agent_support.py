@@ -20,7 +20,7 @@ from app.agent.tools import Toolbox
 from app.config.agent import AgentSettings
 from app.db.deletion import UserDataEraser, UserDataOutsidePostgres
 from app.models.base import GenerationRequest, GenerationResult, Generator, ToolCall
-from app.models.errors import ModelError
+from app.models.errors import ModelError, SchemaOutputError
 from app.models.fakes import FakeEmbedder, FakeGenerator
 from app.pipeline.vocabulary.corrections import ItemCorrection
 from app.pipeline.vocabulary.normalize import Normalizer
@@ -127,10 +127,19 @@ def final_answer(
     return structured_reply(structured)
 
 
-def text_reply(text: str) -> GenerationResult:
+def text_reply(text: str, finish_reason: str = "stop") -> GenerationResult:
     """A model reply in prose, with no tool calls and no answer object."""
     return GenerationResult(
-        text=text, structured=None, tool_calls=(), finish_reason="stop", model=TEXT_MODEL
+        text=text, structured=None, tool_calls=(), finish_reason=finish_reason, model=TEXT_MODEL
+    )
+
+
+def cut_off_answer() -> SchemaOutputError:
+    """What the model client raises when the answer step's JSON was cut off at the output limit."""
+    return SchemaOutputError(
+        f"generate with {TEXT_MODEL} did not return a JSON object for schema 'answer'",
+        operation="generate",
+        model=TEXT_MODEL,
     )
 
 

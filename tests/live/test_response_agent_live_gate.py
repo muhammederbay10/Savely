@@ -14,7 +14,13 @@ import httpx
 import pytest
 
 import app.models.factory
-from tests.live.test_response_agent_live import QUESTIONS, RUNS_PER_QUESTION, live_run_blocker
+from tests.live.test_response_agent_live import (
+    ENV_EXAMPLE,
+    QUESTIONS,
+    RUNS_PER_QUESTION,
+    env_example_agent_settings,
+    live_run_blocker,
+)
 
 pytest_plugins = ["pytester"]
 
@@ -123,3 +129,12 @@ def test_a_local_opt_in_with_a_key_may_run(ci: str | None) -> None:
         environ["CI"] = ci
 
     assert live_run_blocker(environ) is None
+
+
+def test_the_live_check_uses_the_agent_settings_of_env_example() -> None:
+    settings = env_example_agent_settings()
+    lines = ENV_EXAMPLE.read_text(encoding="utf-8").splitlines()
+
+    assert f"AGENT_MAX_STEPS={settings.agent_max_steps}" in lines
+    assert f"AGENT_MAX_RESULTS_PER_ANSWER={settings.agent_max_results_per_answer}" in lines
+    assert f"AGENT_MAX_OUTPUT_TOKENS={settings.agent_max_output_tokens}" in lines

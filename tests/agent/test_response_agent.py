@@ -4,6 +4,7 @@ These tests need Postgres with PostGIS and pgvector (see `tests/database.py`).
 Every name, place and id is synthetic.
 """
 
+import uuid
 from collections.abc import AsyncIterator
 
 import pytest
@@ -463,9 +464,13 @@ async def test_results_are_capped_and_the_rest_kept_for_show_more(
 
     answer = await under_test.agent.answer(turn(saves, "what did I save lately?"))
 
+    (search,) = tool_results(under_test.generator.requests[1])
+    found = [uuid.UUID(str(result["item_id"])) for result in search["results"]]  # type: ignore[union-attr]
+    not_listed = [item_id for item_id in found if item_id not in ids]
     assert [card.item_id for card in answer.messages.results] == ids[:MAX_RESULTS]
-    assert list(answer.more_item_ids) == ids[MAX_RESULTS:]
-    assert list(answer.working_set) == ids
+    # What the answer listed beyond the cap, then the search results it did not list.
+    assert list(answer.more_item_ids) == ids[MAX_RESULTS:] + not_listed
+    assert list(answer.working_set) == ids + not_listed
 
 
 async def test_the_last_step_forbids_tools_and_the_step_limit_is_an_error(

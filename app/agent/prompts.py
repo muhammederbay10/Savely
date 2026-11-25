@@ -21,6 +21,7 @@ _PLACEHOLDERS: Final[dict[str, frozenset[str]]] = {
     "working_set": frozenset({"items", "shown"}),
     "working_set_searches": frozenset({"searches"}),
     "answer_too_long": frozenset({"max_bytes"}),
+    "answer_cut_off": frozenset({"max_results"}),
 }
 
 
@@ -47,6 +48,8 @@ class AgentPrompts:
             its `item_ids`, e.g. it says it shows results but lists none.
         answer_now: Starts the answer step: the model writes its final answer
             in the answer format and may not call tools.
+        answer_cut_off: Sent back when the answer was cut off at the output
+            limit; `{max_results}` is the most items one answer lists.
         answer_too_long: Sent back when the answer does not fit in one DM;
             `{max_bytes}` is the limit.
         wording_request: Asks for the bot's fixed words in a language that has
@@ -64,6 +67,7 @@ class AgentPrompts:
     outcome_mismatch: str
     answer_too_long: str
     answer_now: str
+    answer_cut_off: str
     wording_request: str
 
     def __post_init__(self) -> None:
@@ -102,9 +106,11 @@ def _placeholders(field_name: str, template: str) -> frozenset[str]:
 # Version 2026-11-20.3 was approved for now by Muhammed on 2026-11-20 (record 0015, Q3).
 # 2026-11-21.1 adds short-term memory and the profile (SAV-18). Both are scored on the
 # eval set when SAV-19/20 exist. 2026-11-24.1 makes the model search before it answers,
-# adds `outcome` and the answer step (SAV-38). Change the version with any change to the wording.
+# adds `outcome` and the answer step (SAV-38). 2026-11-25.1 caps `item_ids` at the results
+# one answer sends and asks again after a cut-off answer (SAV-38 live check).
+# Change the version with any change to the wording.
 AGENT_PROMPTS: Final = AgentPrompts(
-    version="2026-11-24.1",
+    version="2026-11-25.1",
     system=(
         "You are Savely, a chat assistant for the posts this user saved. You answer only "
         "from their own saves, and only through the tools: never invent an item, a place, a "
@@ -116,10 +122,11 @@ AGENT_PROMPTS: Final = AgentPrompts(
         "look: call the tool now.\n"
         "- Reply in the language of the user's latest message, whatever it is, in one or "
         "two short sentences. Set `language` to its BCP 47 tag, e.g. 'en', 'tr', 'ja'.\n"
-        "- List the items to show in `item_ids`, best first, using only ids the tools "
-        "returned or the user's last results. The first {max_results} are sent as replies "
-        "that quote each saved post, with its link; do not repeat names or links in "
-        "`reply`. If there are more, say so and that the user can ask for more.\n"
+        "- List at most {max_results} items to show in `item_ids`, best first, using only "
+        "ids the tools returned or the user's last results. They are sent as replies that "
+        "quote each saved post, with its link; do not repeat names or links in `reply`. "
+        "The other results are kept, in order, for 'show more': if there are more, say so "
+        "and that the user can ask for more.\n"
         "- If nothing was found, say so plainly. Nothing found is often the true answer.\n"
         "- Set `outcome`: 'results' when the reply shows the items in `item_ids`, which "
         "must not be empty; 'no_results' when a search found nothing that matches, with an "
@@ -179,6 +186,11 @@ AGENT_PROMPTS: Final = AgentPrompts(
     answer_now=(
         "Write your final answer now, in the answer format, from what the tools returned "
         "and the user's last results. You cannot call tools in this step."
+    ),
+    answer_cut_off=(
+        "Your answer was cut off: it was longer than one answer may be. Answer again with "
+        "a shorter `reply` and at most {max_results} ids in `item_ids`; the other results "
+        "are kept for 'show more'."
     ),
     wording_request=(
         "Translate the bot's fixed messages in `wording` into the language with the BCP 47 "

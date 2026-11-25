@@ -229,7 +229,8 @@ async def test_answers_to_one_sender_are_sent_and_stored_one_at_a_time(
     last_list = delivered[-1]
     session = await chat_stores.memory.load(user_id)
     assert session.working_set is not None
-    assert session.working_set.item_ids == last_list
+    # B's list leads its working set; its other search results follow for "show more".
+    assert session.working_set.item_ids[: len(last_list)] == last_list
     follow_up = await chat_stores.send_text(user_id, "the first one")
     await second.responder.respond(user_id, follow_up, last_try=False)
-    assert tuple(turns[-1].working_set) == last_list
+    assert tuple(turns[-1].working_set) == session.working_set.item_ids
