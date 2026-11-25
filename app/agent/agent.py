@@ -1,6 +1,7 @@
 """The response agent: understands a DM, calls tools, and writes a short answer (ARCHITECTURE §3.5).
 
-One answer is a loop of at most `AGENT_MAX_STEPS` model calls:
+One answer is a loop of at most `AGENT_MAX_STEPS` model calls, plus one retry
+of an answer that was cut off:
 
 1. **Tool steps.** The text model reads the conversation with the tools and
    no answer format, and calls tools or stops. Sending the format next to
@@ -24,6 +25,12 @@ One answer is a loop of at most `AGENT_MAX_STEPS` model calls:
    to the model with what was wrong, within the same step limit; a malformed
    one is asked for again in the answer step, any other goes back to a tool
    step, so the model can search before it answers again.
+5. **A cut-off answer.** An answer that hits the output limit is no JSON
+   (`SchemaOutputError`). It is asked for again in the answer step, shorter
+   and with at most `AGENT_MAX_RESULTS_PER_ANSWER` items. The first such retry
+   of a turn gets one call beyond the step limit, so a cut-off answer at the
+   last step still recovers; another cut-off uses the normal steps. A prose
+   reply cut off in a tool step is dropped, not kept as the answer's draft.
 
 **"Delete my data".** `request_data_deletion` makes the answer the fixed
 confirmation question in the user's language, and prepares the fixed "done"
@@ -32,9 +39,15 @@ makes it confirmable only after delivering it (`app.agent.send.send_answer`).
 A successful `confirm_data_deletion` ends the turn at once with that "done"
 message: no model call, translation or other tool runs after the erasure.
 
-The items are capped at `AGENT_MAX_RESULTS_PER_ANSWER`; the rest are kept for
-"show more". Each shown item becomes a reply quoting the saved post
-(`app/agent/replies/answers.py`, decision record 0004).
+**The cap.** An answer lists at most `AGENT_MAX_RESULTS_PER_ANSWER` items: the
+answer format says so (`maxItems`), and so does the prompt, so the answer stays
+short. The code never relies on it: only the first that many are shown. The
+rest are kept in order for "show more" (`AgentAnswer.more_item_ids`): first the
+items the answer listed beyond the cap, then this turn's search results the
+answer did not show; when the answer continues the last results without a new
+search ("show more"), the last results not shown yet. Each shown item becomes
+a reply quoting the saved post (`app/agent/replies/answers.py`, decision
+record 0004).
 
 **Working set.** "Mark the second one as watched" needs the results the user
 saw last. The caller passes them in `AgentTurn.working_set`, in the order they
@@ -89,6 +102,7 @@ from app.models.base import (
     OutputSchema,
     ToolDefinition,
 )
+from app.models.errors import SchemaOutputError
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +111,8 @@ _WORDING_SCHEMA_NAME = "reply_wording"
 # The built-in wording that a translation starts from.
 _SOURCE_LANGUAGE = "en"
 _SECONDS_PER_MINUTE = 60
+# The finish reason of a reply that hit the output limit.
+_CUT_OFF_FINISH_REASON = "length"
 
 
 class AgentError(Exception):
@@ -220,36 +236,46 @@ class _FinalAnswer(BaseModel):
         return self.reply.strip() if not notice else f"{self.reply.strip()}\n\n{notice}"
 
 
-_ANSWER_SCHEMA = OutputSchema(
-    name=_ANSWER_SCHEMA_NAME,
-    schema={
-        "type": "object",
-        "properties": {
-            "language": {"type": "string", "description": "BCP 47 tag of the reply's language."},
-            "reply": {"type": "string", "description": "The short reply, in that language."},
-            "notice": {
-                "type": ["string", "null"],
-                "description": "Required when a tool result listed notices; otherwise null.",
+def _answer_schema(max_results: int) -> OutputSchema:
+    """The final answer's format; `item_ids` holds at most `max_results` ids."""
+    return OutputSchema(
+        name=_ANSWER_SCHEMA_NAME,
+        schema={
+            "type": "object",
+            "properties": {
+                "language": {
+                    "type": "string",
+                    "description": "BCP 47 tag of the reply's language.",
+                },
+                "reply": {"type": "string", "description": "The short reply, in that language."},
+                "notice": {
+                    "type": ["string", "null"],
+                    "description": "Required when a tool result listed notices; otherwise null.",
+                },
+                "item_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": max_results,
+                    "description": (
+                        f"At most {max_results} items to show, best first. The other "
+                        "results are kept for 'show more'."
+                    ),
+                },
+                "outcome": {
+                    "type": "string",
+                    "enum": [outcome.value for outcome in AnswerOutcome],
+                    "description": (
+                        "results: the reply shows the items in item_ids, which is not empty. "
+                        "no_results: a search found nothing that matches; item_ids is empty. "
+                        "other: anything else, such as a question to the user."
+                    ),
+                },
             },
-            "item_ids": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "The items to show, best first.",
-            },
-            "outcome": {
-                "type": "string",
-                "enum": [outcome.value for outcome in AnswerOutcome],
-                "description": (
-                    "results: the reply shows the items in item_ids, which is not empty. "
-                    "no_results: a search found nothing that matches; item_ids is empty. "
-                    "other: anything else, such as a question to the user."
-                ),
-            },
+            "required": ["language", "reply", "notice", "item_ids", "outcome"],
+            "additionalProperties": False,
         },
-        "required": ["language", "reply", "notice", "item_ids", "outcome"],
-        "additionalProperties": False,
-    },
-)
+    )
+
 
 _WORDING_SCHEMA = OutputSchema(
     name=_WORDING_SCHEMA_NAME,
@@ -269,7 +295,11 @@ class _Turn:
     tools: UserTools
     allowed_item_ids: set[uuid.UUID]
     previous_searches: tuple[SearchUsed, ...]
+    # The last results the user has not seen yet, in order, for "show more".
+    previous_unshown: tuple[uuid.UUID, ...]
     searches: list[SearchUsed] = field(default_factory=list)
+    # This turn's search results, in the order the searches returned them.
+    found: dict[uuid.UUID, None] = field(default_factory=dict)
     notices: set[Notice] = field(default_factory=set)
     availability_gaps: dict[tuple[uuid.UUID, str], AvailabilityGap] = field(default_factory=dict)
     asks_deletion_confirmation: bool = False
@@ -298,6 +328,7 @@ class ResponseAgent:
         self._toolbox = toolbox
         self._prompts = prompts
         self._settings = settings
+        self._answer_schema = _answer_schema(settings.agent_max_results_per_answer)
 
     async def answer(self, turn: AgentTurn) -> AgentAnswer:
         """Answer one message.
@@ -309,7 +340,8 @@ class ResponseAgent:
             The answer to send.
 
         Raises:
-            AgentStepLimitError: If no valid answer came within `AGENT_MAX_STEPS`.
+            AgentStepLimitError: If no valid answer came within `AGENT_MAX_STEPS`
+                (and the one retry of a cut-off answer).
             AgentWordingError: If the answer's language has no wording and the
                 model gave none that is usable.
             ModelError: If a model call failed.
@@ -328,18 +360,31 @@ class ResponseAgent:
             tools=tools,
             allowed_item_ids=set(turn.working_set),
             previous_searches=tuple(turn.working_set_searches),
+            previous_unshown=_unshown(turn),
         )
         messages = self._opening_messages(turn)
         definitions = tools.definitions()
         max_steps = self._settings.agent_max_steps
+        limit = max_steps
         answering = False
-        for step in range(1, max_steps + 1):
-            if step == max_steps and not answering:
+        step = 0
+        while step < limit:
+            step += 1
+            if step == limit and not answering:
                 messages.append(Message(role="system", content=self._prompts.answer_now))
                 answering = True
-            result = await self._generator.generate(
-                self._request(messages, definitions, answering=answering)
-            )
+            try:
+                result = await self._generator.generate(
+                    self._request(messages, definitions, answering=answering)
+                )
+            except SchemaOutputError:
+                if not answering:
+                    raise
+                messages.append(Message(role="system", content=self._answer_cut_off()))
+                if limit == max_steps:
+                    limit += 1
+                logger.warning("agent_answer_cut_off", extra={"step": step})
+                continue
             if result.tool_calls:
                 tool_messages, completion = await self._run_tools(result, state)
                 if completion is not None:
@@ -352,8 +397,10 @@ class ResponseAgent:
             final = _parse_answer(result.structured if answering else _json_or_none(result.text))
             if final is None and not answering:
                 # The model is done with the tools but wrote no answer object:
-                # ask for it in the answer step, which sends the format.
-                messages.extend(self._answer_step_messages(result.text))
+                # ask for it in the answer step, which sends the format. A draft
+                # cut off at the output limit is dropped, so it isn't repeated.
+                cut_off = result.finish_reason == _CUT_OFF_FINISH_REASON
+                messages.extend(self._answer_step_messages("" if cut_off else result.text))
                 answering = True
                 continue
             problem = self._prompts.invalid_answer
@@ -369,8 +416,8 @@ class ResponseAgent:
             # A malformed answer is asked for again with the format; any other
             # problem may need a search, so the model gets the tools back.
             answering = final is None
-        logger.warning("agent_step_limit_reached", extra={"steps": max_steps})
-        raise AgentStepLimitError(f"no valid answer within {max_steps} steps")
+        logger.warning("agent_step_limit_reached", extra={"steps": step})
+        raise AgentStepLimitError(f"no valid answer within {step} steps")
 
     def _request(
         self,
@@ -386,10 +433,15 @@ class ResponseAgent:
         """
         return GenerationRequest(
             messages=tuple(messages),
-            output_schema=_ANSWER_SCHEMA if answering else None,
+            output_schema=self._answer_schema if answering else None,
             tools=definitions,
             tool_choice="none" if answering else "auto",
             max_output_tokens=self._settings.agent_max_output_tokens,
+        )
+
+    def _answer_cut_off(self) -> str:
+        return self._prompts.answer_cut_off.format(
+            max_results=self._settings.agent_max_results_per_answer
         )
 
     def _answer_step_messages(self, draft: str) -> list[Message]:
@@ -455,6 +507,7 @@ class ResponseAgent:
             state.asks_deletion_confirmation |= outcome.asks_deletion_confirmation
             if outcome.search is not None:
                 state.searches.append(outcome.search)
+                state.found.update(dict.fromkeys(outcome.offered_item_ids))
             messages.append(
                 Message(role="tool", content=outcome.as_json(), tool_call_id=tool_call.id)
             )
@@ -485,7 +538,7 @@ class ResponseAgent:
             language=final.language,
             messages=AnswerMessages(intro=final.intro(), results=shown, wording=wording),
             notices=frozenset(state.notices),
-            more_item_ids=tuple(card.item_id for card in cards[cap:]),
+            more_item_ids=_more_item_ids(shown, cards[cap:], state),
             availability_gaps=tuple(state.availability_gaps.values()),
             searches=searches,
         )
@@ -554,6 +607,34 @@ class ResponseAgent:
                 "language": answer.language,
             },
         )
+
+
+def _unshown(turn: AgentTurn) -> tuple[uuid.UUID, ...]:
+    """Return the last results the user was not shown yet, in order."""
+    shown = len(turn.working_set) if turn.working_set_shown is None else turn.working_set_shown
+    return tuple(turn.working_set[shown:])
+
+
+def _more_item_ids(
+    shown: Sequence[ResultCard], listed_beyond_cap: Sequence[ResultCard], state: _Turn
+) -> tuple[uuid.UUID, ...]:
+    """Return the results kept for "show more", in order; none when nothing is shown.
+
+    First the items the answer listed beyond the cap, then the results it did
+    not show: this turn's search results, or, when the answer continues the
+    last results without a new search, the last results not shown yet.
+    """
+    if not shown:
+        return ()
+    shown_ids = [card.item_id for card in shown]
+    if state.searches:
+        pool: Sequence[uuid.UUID] = tuple(state.found)
+    elif set(shown_ids) <= set(state.previous_unshown):
+        pool = state.previous_unshown
+    else:
+        pool = ()
+    candidates = [card.item_id for card in listed_beyond_cap] + list(pool)
+    return tuple(item_id for item_id in dict.fromkeys(candidates) if item_id not in shown_ids)
 
 
 def _json_or_none(text: str) -> object:

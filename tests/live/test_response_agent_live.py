@@ -25,6 +25,7 @@ how to read the result. A run costs a few cents.
 import os
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -34,10 +35,12 @@ from app.agent.prompts import AGENT_PROMPTS
 from app.agent.search.prompts import RETRIEVAL_PROMPTS
 from app.agent.search.retrieval import HybridRetriever
 from app.agent.tools import NEAR_TOOL, SEARCH_ITEMS_TOOL
+from app.config.agent import AgentSettings
 from app.config.models import ModelSettings
 from app.db.models import Entity, ItemEntity, ItemStatus, SavedItem
 from app.db.types import GeoPoint
 from app.models.base import GenerationRequest, GenerationResult, Generator
+from app.models.errors import SchemaOutputError
 from app.models.factory import ModelClients, build_model_clients, open_http_client
 from tests.agent.agent_support import (
     FakeClock,
@@ -78,13 +81,22 @@ pytestmark = [
 ]
 
 RUNS_PER_QUESTION = 3
-# The same step limit as `.env.example`, so the check sees production's loop.
-MAX_STEPS = 6
 SEARCH_TOOLS = frozenset({SEARCH_ITEMS_TOOL, NEAR_TOOL})
+# The agent runs with these settings from `.env.example`, so it has production's
+# step limit, result cap and output limit, not the unit tests' smaller ones.
+ENV_EXAMPLE = Path(__file__).resolve().parents[2] / ".env.example"
+AGENT_SETTINGS_FROM_ENV_EXAMPLE = (
+    "AGENT_MAX_STEPS",
+    "AGENT_MAX_RESULTS_PER_ANSWER",
+    "AGENT_MAX_OUTPUT_TOKENS",
+)
+# Matches all of the user's saves, more than one answer shows, so the answer
+# must show at most the cap and keep the rest for "show more".
+ALL_SAVES_QUESTION = "What did i save?"
 # (language, question). The seeded user's country is US, where a saved horror
 # movie streams on Netflix.
 QUESTIONS = [
-    ("en", "What did i save?"),
+    ("en", ALL_SAVES_QUESTION),
     ("en", "restaurants in Kadıköy"),
     ("tr", "kaydettiğim tatlıcılar"),
     ("tr", "netflixte ne izleyebilirim"),
@@ -99,9 +111,14 @@ class RecordingGenerator(Generator):
 
     model: Generator
     replies: list[GenerationResult] = field(default_factory=list)
+    cut_offs: int = 0
 
     async def generate(self, request: GenerationRequest) -> GenerationResult:
-        reply = await self.model.generate(request)
+        try:
+            reply = await self.model.generate(request)
+        except SchemaOutputError:
+            self.cut_offs += 1
+            raise
         self.replies.append(reply)
         return reply
 
@@ -179,6 +196,22 @@ def _place_item(
     )
 
 
+def env_example_agent_settings() -> AgentSettings:
+    """Return agent settings with the step limit, cap and output limit of `.env.example`.
+
+    Raises:
+        KeyError: If `.env.example` lacks one of them.
+    """
+    values: dict[str, str] = {}
+    for line in ENV_EXAMPLE.read_text(encoding="utf-8").splitlines():
+        name, separator, value = line.partition("=")
+        if separator and name.strip() in AGENT_SETTINGS_FROM_ENV_EXAMPLE:
+            values[name.strip()] = value.strip()
+    return agent_settings(
+        **{name.lower(): int(values[name]) for name in AGENT_SETTINGS_FROM_ENV_EXAMPLE}
+    )
+
+
 def build_live_agent(
     sessions: async_sessionmaker[AsyncSession], clients: ModelClients, model: Generator
 ) -> ResponseAgent:
@@ -199,15 +232,16 @@ def build_live_agent(
         generator=model,
         toolbox=toolbox,
         prompts=AGENT_PROMPTS,
-        settings=agent_settings(agent_max_steps=MAX_STEPS),
+        settings=env_example_agent_settings(),
     )
 
 
 def _describe(run: int, recorder: RecordingGenerator, answer: AgentAnswer) -> str:
     return (
         f"run={run} prompts={AGENT_PROMPTS.version} answered_in={answer.language} "
-        f"model_calls={len(recorder.replies)} tools={recorder.tools_called} "
-        f"items={len(answer.messages.results)}"
+        f"model_calls={len(recorder.replies)} cut_offs={recorder.cut_offs} "
+        f"tools={recorder.tools_called} items={len(answer.messages.results)} "
+        f"kept_for_more={len(answer.more_item_ids)}"
     )
 
 
@@ -231,3 +265,12 @@ async def test_the_agent_searches_and_answers_with_saved_items(
     outcome = _describe(run, recorder, answer)
     assert SEARCH_TOOLS & set(recorder.tools_called), f"no search tool was called: {outcome}"
     assert answer.messages.results, f"no saved item was sent: {outcome}"
+    cap = env_example_agent_settings().agent_max_results_per_answer
+    assert len(answer.messages.results) <= cap, f"more items than one answer sends: {outcome}"
+    if question == ALL_SAVES_QUESTION:
+        assert _owned_saves(saves) > cap, "the seed must hold more saves than one answer shows"
+        assert answer.more_item_ids, f"the saves not shown were not kept: {outcome}"
+
+
+def _owned_saves(saves: Saves) -> int:
+    return sum(1 for item in saves.items.values() if item.user_id == saves.user.id)
