@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.agent.agent import ResponseAgent
+from app.agent.agent import AnswerOutcome, ResponseAgent
 from app.agent.deletion_requests import DeletionRequests, PendingDeletion
 from app.agent.prompts import AGENT_PROMPTS
 from app.agent.search.retrieval import HybridRetriever
@@ -20,7 +20,7 @@ from app.agent.tools import Toolbox
 from app.config.agent import AgentSettings
 from app.db.deletion import UserDataEraser, UserDataOutsidePostgres
 from app.models.base import GenerationRequest, GenerationResult, Generator, ToolCall
-from app.models.errors import ModelError
+from app.models.errors import ModelError, SchemaOutputError
 from app.models.fakes import FakeEmbedder, FakeGenerator
 from app.pipeline.vocabulary.corrections import ItemCorrection
 from app.pipeline.vocabulary.normalize import Normalizer
@@ -108,15 +108,39 @@ def final_answer(
     reply: str,
     item_ids: Sequence[uuid.UUID] = (),
     notice: str | None = None,
+    outcome: AnswerOutcome | None = None,
 ) -> GenerationResult:
-    """A model reply with the final answer."""
+    """A model reply with the final answer.
+
+    Without an `outcome`, it is `results` when items are listed and
+    `no_results` when none are.
+    """
+    if outcome is None:
+        outcome = AnswerOutcome.RESULTS if item_ids else AnswerOutcome.NO_RESULTS
     structured = {
         "language": language,
         "reply": reply,
         "notice": notice,
         "item_ids": [str(item_id) for item_id in item_ids],
+        "outcome": outcome.value,
     }
     return structured_reply(structured)
+
+
+def text_reply(text: str, finish_reason: str = "stop") -> GenerationResult:
+    """A model reply in prose, with no tool calls and no answer object."""
+    return GenerationResult(
+        text=text, structured=None, tool_calls=(), finish_reason=finish_reason, model=TEXT_MODEL
+    )
+
+
+def cut_off_answer() -> SchemaOutputError:
+    """What the model client raises when the answer step's JSON was cut off at the output limit."""
+    return SchemaOutputError(
+        f"generate with {TEXT_MODEL} did not return a JSON object for schema 'answer'",
+        operation="generate",
+        model=TEXT_MODEL,
+    )
 
 
 def structured_reply(structured: Mapping[str, object]) -> GenerationResult:
@@ -179,28 +203,13 @@ def build_agent(
     """The agent with real tools on the test database and a scripted text model."""
     generator = FakeGenerator(script)
     vocabulary_classifier = classifier or ScriptedClassifier()
-    normalizer = Normalizer(
+    toolbox = build_toolbox(
         sessions,
-        vocabulary_classifier,
-        FakeEmbedder(dimensions=TEST_EMBEDDING_DIMENSION),
-        PIPELINE_PROMPTS,
-        RULES,
-    )
-    toolbox = Toolbox(
-        sessions=sessions,
         retriever=retriever or build_retriever(),
-        corrections=ItemCorrection(
-            sessions,
-            normalizer,
-            CONTENT_TYPES,
-            alias_min_probability=RULES.alias_min_probability,
-            review_min_users=REVIEW_MIN_USERS,
-        ),
-        registry=CONTENT_TYPES,
+        classifier=vocabulary_classifier,
         deletion_requests=deletion_requests or MemoryDeletionRequests(),
-        eraser=UserDataEraser(sessions, outside_postgres),
-        deletion_window=timedelta(seconds=CONFIRM_SECONDS),
-        now=clock or FakeClock(),
+        outside_postgres=outside_postgres,
+        clock=clock or FakeClock(),
     )
     agent = ResponseAgent(
         generator=wrap_generator(generator) if wrap_generator else generator,
@@ -210,4 +219,39 @@ def build_agent(
     )
     return AgentUnderTest(
         agent=agent, generator=generator, classifier=vocabulary_classifier, toolbox=toolbox
+    )
+
+
+def build_toolbox(
+    sessions: async_sessionmaker[AsyncSession],
+    *,
+    retriever: HybridRetriever,
+    classifier: ScriptedClassifier,
+    deletion_requests: DeletionRequests,
+    outside_postgres: Sequence[UserDataOutsidePostgres] = (),
+    clock: Callable[[], datetime],
+) -> Toolbox:
+    """The real tools on the test database, with offline vocabulary corrections."""
+    normalizer = Normalizer(
+        sessions,
+        classifier,
+        FakeEmbedder(dimensions=TEST_EMBEDDING_DIMENSION),
+        PIPELINE_PROMPTS,
+        RULES,
+    )
+    return Toolbox(
+        sessions=sessions,
+        retriever=retriever,
+        corrections=ItemCorrection(
+            sessions,
+            normalizer,
+            CONTENT_TYPES,
+            alias_min_probability=RULES.alias_min_probability,
+            review_min_users=REVIEW_MIN_USERS,
+        ),
+        registry=CONTENT_TYPES,
+        deletion_requests=deletion_requests,
+        eraser=UserDataEraser(sessions, outside_postgres),
+        deletion_window=timedelta(seconds=CONFIRM_SECONDS),
+        now=clock,
     )

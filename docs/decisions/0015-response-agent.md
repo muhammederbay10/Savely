@@ -56,3 +56,38 @@ Muhammed decided all nine questions in chat on 2026-11-20 ("Approve all nine"). 
 - **Schema:** `saved_item.user_status` (migration 0003, Q6). `ChatMessage.quick_reply_payload` is a new optional field of the adapter's output.
 - **New settings:** `AGENT_MAX_STEPS`, `AGENT_MAX_RESULTS_PER_ANSWER`, `AGENT_MAX_OUTPUT_TOKENS`, `VOCAB_ALIAS_REVIEW_MIN_USERS`, `DATA_DELETION_CONFIRM_SECONDS`.
 - **Costs:** one text-model call per step; one more per answer only for a language without built-in wording.
+
+## Update: tool steps and the answer step (SAV-38, 24 Nov 2026)
+
+**Context.** In the owner's live test on `e30b152`, the bot answered "What did i save?" with "Let me pull up your saves." and no items; the log had `agent_answered steps=3 results=0` and no `agent_tool_called`. Replayed through the real `ResponseAgent`, `deepseek/deepseek-v4.1-flash` on CoreWeave never called a tool in 3 of 3 tries when a request carried both the tools and the answer's `response_format`; it went straight to the final JSON, once with "Here's what you saved most recently." and no items. With the same messages and tools but no `response_format`, it called `search_items` in 3 of 3 tries.
+
+**Decision.**
+- **Tool steps send the tools and no answer format** (`tool_choice="auto"`). When the model stops calling tools, a reply that is already a valid answer object is taken as it is; otherwise the next call is the **answer step**: the answer format, with tool calls forbidden (`tool_choice="none"`; the tools are still listed because the conversation holds tool calls). The last step is always an answer step, as before.
+- **The answer carries `outcome`**: `results` (the reply shows the items in `item_ids`, which must not be empty), `no_results` (a search found nothing; `item_ids` is empty) or `other` (a question, a greeting, a confirmation). The model reports it, so the check works in any language and never reads the reply's words. An answer whose `outcome` does not match `item_ids` is sent back like any other failed check. The deletion question replaces the reply, so it is not checked there.
+- **Where a failed answer goes:** a malformed answer is asked for again in the answer step; any other failed check goes back to a tool step, so the model can search before it answers again.
+- The prompt (`2026-11-24.1`) tells the model to call the tools before it answers, never to promise to look, and how to set `outcome`.
+- **Real-model check:** `tests/live/test_response_agent_live.py`, opt-in, run by the owner before a push (SAV-22, 24 Nov 2026 update).
+
+**Alternatives considered.**
+- **`tool_choice="required"` with a "reply" tool for the answer:** one call fewer, but the live evidence covers only "tools without a format", and whether the pinned provider honours `required` with this model was not checked. It also changes the answer's contract (see the alternatives above).
+- **Matching words like "here's what you saved" in the reply:** works in one language only; ruled out by decision record 0005.
+
+**Consequences.** An answer the model writes in prose costs one more call (the answer step), within `AGENT_MAX_STEPS`. The answer schema has a new required field, `outcome`.
+
+### Long answers (SAV-38 live check, 25 Nov 2026)
+
+**Context.** In the owner's combined live run (SAV-39 head `cce6839`, which contains `2420a7d`), all 12 runs called a search tool and 11 answered. In one "What did i save?" run the answer step listed all 11 item ids; its JSON was cut off at the output limit (400 tokens in the test, 600 in `.env.example`) and the turn ended in `SchemaOutputError`. An answer's size grew with every id the model wrote, so a user with many saves could hit any fixed limit. The owner decided to fix it, not to raise the limit.
+
+**Decision.**
+- **The answer lists at most `AGENT_MAX_RESULTS_PER_ANSWER` items**: the answer format's `item_ids` has `maxItems` and says so, the prompt says so, and the code shows only that many whatever the model lists. The answer stays a few hundred tokens at most.
+- **The rest are kept for "show more"**, in order: the ids the answer listed beyond the cap, then the unlisted results of the searches the answer presents. Each item the answer lists, beyond the cap too, belongs to the latest search that returned it, so a broad search replaced by a narrower one (all saves, then restaurants) adds nothing, while an answer drawn from two searches keeps both, even when one appears only beyond the cap (SAV-38 review, rounds 4 and 5). When the answer continues the last results without a new search, the last results not shown yet are kept instead. An answer that shows nothing keeps nothing, so the previous working set stays.
+- **A cut-off answer is asked for again.** The answer step's reply that is no JSON (`SchemaOutputError`, which is how a cut-off at the output limit arrives) goes back to the model with "answer again, shorter, with at most N ids", in the answer step. The first such retry in a turn gets one call beyond `AGENT_MAX_STEPS`, so a cut-off at the last step still recovers; a second one uses the normal steps, and the step limit still ends the turn. A prose reply cut off in a tool step (`finish_reason` `length`) is dropped instead of being kept as the answer's draft. Ownership, notices, the answer checks and the deletion flow are unchanged.
+- Prompt `2026-11-25.1`. The live check runs with the agent settings of `.env.example` and checks the cap and "show more" for "What did i save?".
+
+**Alternatives considered.**
+- **A larger `AGENT_MAX_OUTPUT_TOKENS`:** moves the limit without removing it; ruled out by the owner.
+- **Repairing a cut-off JSON** (closing the brackets of a partial answer): the reply itself may be cut, and a repaired answer could not be checked like a whole one.
+- **Asking again only within `AGENT_MAX_STEPS`:** a cut-off at the last step, the forced answer step, would still end in the error message.
+- **Leaving the cap to the model only:** the model ignored the old prompt's cap; the code must not trust it.
+
+**Consequences.** "Show more" can list search results the answer chose not to show. `maxItems` in the answer format is checked only by the opt-in live run; if the pinned provider ignores it, the code's cap and the retry still hold. A turn makes at most `AGENT_MAX_STEPS` + 1 text-model calls (plus the wording translation).

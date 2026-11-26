@@ -856,7 +856,8 @@ async def test_an_older_answers_late_storing_keeps_the_newer_results_and_the_ord
 
     session = await chat_stores.memory.load(user_id)
     assert session.working_set is not None
-    assert session.working_set.item_ids == (newer.id,)
+    # The newer answer's list leads; its other search results follow for "show more".
+    assert session.working_set.item_ids[0] == newer.id
     assert [(message.role, message.content) for message in session.history] == [
         ("user", "restaurants in Bebek"),
         ("assistant", "Older list:"),
@@ -865,7 +866,7 @@ async def test_an_older_answers_late_storing_keeps_the_newer_results_and_the_ord
     ]
     follow_up = await chat_stores.send_text(user_id, "the first one")
     await chat.responder.respond(user_id, follow_up, last_try=False)
-    assert tuple(turns[-1].working_set) == (newer.id,)
+    assert tuple(turns[-1].working_set) == session.working_set.item_ids
     # No answer was sent again.
     assert chat.sent_texts().count("Older list:") == 1
     assert chat.sent_texts().count("Newer list:") == 1

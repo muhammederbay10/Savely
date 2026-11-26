@@ -21,6 +21,7 @@ _PLACEHOLDERS: Final[dict[str, frozenset[str]]] = {
     "working_set": frozenset({"items", "shown"}),
     "working_set_searches": frozenset({"searches"}),
     "answer_too_long": frozenset({"max_bytes"}),
+    "answer_cut_off": frozenset({"max_results"}),
 }
 
 
@@ -43,6 +44,12 @@ class AgentPrompts:
         invalid_answer: Sent back when the final answer does not follow its format.
         unknown_items: Sent back when the answer lists items no tool returned.
         missing_notice: Sent back when the answer leaves out a required notice.
+        outcome_mismatch: Sent back when the answer's `outcome` does not match
+            its `item_ids`, e.g. it says it shows results but lists none.
+        answer_now: Starts the answer step: the model writes its final answer
+            in the answer format and may not call tools.
+        answer_cut_off: Sent back when the answer was cut off at the output
+            limit; `{max_results}` is the most items one answer lists.
         answer_too_long: Sent back when the answer does not fit in one DM;
             `{max_bytes}` is the limit.
         wording_request: Asks for the bot's fixed words in a language that has
@@ -57,7 +64,10 @@ class AgentPrompts:
     invalid_answer: str
     unknown_items: str
     missing_notice: str
+    outcome_mismatch: str
     answer_too_long: str
+    answer_now: str
+    answer_cut_off: str
     wording_request: str
 
     def __post_init__(self) -> None:
@@ -95,22 +105,33 @@ def _placeholders(field_name: str, template: str) -> frozenset[str]:
 
 # Version 2026-11-20.3 was approved for now by Muhammed on 2026-11-20 (record 0015, Q3).
 # 2026-11-21.1 adds short-term memory and the profile (SAV-18). Both are scored on the
-# eval set when SAV-19/20 exist. Change the version with any change to the wording.
+# eval set when SAV-19/20 exist. 2026-11-24.1 makes the model search before it answers,
+# adds `outcome` and the answer step (SAV-38). 2026-11-25.1 caps `item_ids` at the results
+# one answer sends and asks again after a cut-off answer (SAV-38 live check).
+# Change the version with any change to the wording.
 AGENT_PROMPTS: Final = AgentPrompts(
-    version="2026-11-21.1",
+    version="2026-11-25.1",
     system=(
         "You are Savely, a chat assistant for the posts this user saved. You answer only "
         "from their own saves, and only through the tools: never invent an item, a place, a "
         "title or a link.\n"
         "- Search with the tools. Pass the user's own words as values; the tools match them "
         "to what the user saved.\n"
+        "- Call the tools before you answer. Never say what the user saved, or that nothing "
+        "was found, unless a tool returned it in this conversation, and never say you will "
+        "look: call the tool now.\n"
         "- Reply in the language of the user's latest message, whatever it is, in one or "
         "two short sentences. Set `language` to its BCP 47 tag, e.g. 'en', 'tr', 'ja'.\n"
-        "- List the items to show in `item_ids`, best first, using only ids the tools "
-        "returned or the user's last results. The first {max_results} are sent as replies "
-        "that quote each saved post, with its link; do not repeat names or links in "
-        "`reply`. If there are more, say so and that the user can ask for more.\n"
+        "- List at most {max_results} items to show in `item_ids`, best first, using only "
+        "ids the tools returned or the user's last results. They are sent as replies that "
+        "quote each saved post, with its link; do not repeat names or links in `reply`. "
+        "The other results are kept, in order, for 'show more': if there are more, say so "
+        "and that the user can ask for more.\n"
         "- If nothing was found, say so plainly. Nothing found is often the true answer.\n"
+        "- Set `outcome`: 'results' when the reply shows the items in `item_ids`, which "
+        "must not be empty; 'no_results' when a search found nothing that matches, with an "
+        "empty `item_ids`; 'other' for anything else, such as a question to the user. A "
+        "reply that lists no items never says it shows or found some.\n"
         "- When a tool result lists `notices`, write `notice`: one short sentence in the "
         "user's language for each of them. backup_mode: search is in backup mode, so the "
         "list may be missing some items. broader_results: some results match less exactly "
@@ -143,7 +164,7 @@ AGENT_PROMPTS: Final = AgentPrompts(
     ),
     invalid_answer=(
         "Your answer did not follow the answer format. Answer again with `language`, "
-        "`reply`, `notice` and `item_ids` only."
+        "`reply`, `notice`, `item_ids` and `outcome` only."
     ),
     unknown_items=(
         "Your answer listed items that no tool returned. Answer again, listing only ids "
@@ -153,9 +174,23 @@ AGENT_PROMPTS: Final = AgentPrompts(
         "The search results came with notices, and your answer has no `notice`. Answer "
         "again with a short `notice` in the user's language."
     ),
+    outcome_mismatch=(
+        "Your `outcome` does not match `item_ids`: 'results' needs the items you show, and "
+        "'no_results' lists none. If you have not searched yet, search with the tools now; "
+        "then answer again, saying plainly if nothing was found."
+    ),
     answer_too_long=(
         "Your `reply` and `notice` together are longer than one message allows "
         "({max_bytes} bytes). Answer again, shorter."
+    ),
+    answer_now=(
+        "Write your final answer now, in the answer format, from what the tools returned "
+        "and the user's last results. You cannot call tools in this step."
+    ),
+    answer_cut_off=(
+        "Your answer was cut off: it was longer than one answer may be. Answer again with "
+        "a shorter `reply` and at most {max_results} ids in `item_ids`; the other results "
+        "are kept for 'show more'."
     ),
     wording_request=(
         "Translate the bot's fixed messages in `wording` into the language with the BCP 47 "
