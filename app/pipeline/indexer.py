@@ -48,6 +48,12 @@ from app.pipeline.media.storage import MediaNotFoundError, MediaStore
 from app.pipeline.media.tools import MediaToolError
 from app.pipeline.payloads import CaptureSource
 from app.pipeline.prompts import PipelinePrompts
+from app.pipeline.recovery.acknowledgment import (
+    CONFIRMATION_RUN_STATUS,
+    CollectionAcknowledger,
+    CollectionAcknowledgment,
+    claim_collection_acknowledgment,
+)
 from app.pipeline.recovery.runs import (
     JsonObject,
     RunStatus,
@@ -60,7 +66,7 @@ from app.pipeline.recovery.runs import (
     record_step,
 )
 from app.pipeline.steps.classify import Classification, PostClassifier
-from app.pipeline.steps.confirm import ConfirmationStatus, SaveConfirmer
+from app.pipeline.steps.confirm import SaveConfirmer
 from app.pipeline.steps.embed import ItemEmbedder
 from app.pipeline.steps.extract import ExtractionResult, Extractor, PostText
 from app.pipeline.steps.fetch import MediaDownloadError, MediaFetcher, MediaKind, StoredMedia
@@ -102,12 +108,6 @@ _DESCRIBED_ERRORS: Final = (
 # The name of the work before the first step, in logs: reading the payload and the item.
 _START: Final = "start"
 _RESUMABLE_STATUSES: Final = frozenset({ItemStatus.PENDING, ItemStatus.ENRICHING})
-_CONFIRMATION_RUN_STATUS: Final = {
-    ConfirmationStatus.SENT: RunStatus.DONE,
-    ConfirmationStatus.OUTSIDE_REPLY_WINDOW: RunStatus.SKIPPED,
-    ConfirmationStatus.SKIPPED: RunStatus.SKIPPED,
-    ConfirmationStatus.FAILED: RunStatus.FAILED,
-}
 
 
 class IndexOutcome(StrEnum):
@@ -204,6 +204,7 @@ class _Attempt:
     item_id: uuid.UUID
     run: _Run | None = None
     last_try: bool = False
+    acknowledgment: CollectionAcknowledgment | None = None
 
     def log_details(self, error: BaseException) -> dict[str, object]:
         """Return the log fields of a failure: ids, where it happened, what it was."""
@@ -271,6 +272,7 @@ class ItemIndexer:
         self._run_deadline_seconds = run_deadline_seconds
         self._failure_recording_seconds = failure_recording_seconds
         self._max_tries = max_tries
+        self._acknowledger = CollectionAcknowledger(sessions, steps.confirmer)
 
     async def index(self, user_id: uuid.UUID, saved_item_id: uuid.UUID) -> IndexOutcome:
         """Index one item, continuing after the steps an earlier try finished.
@@ -333,6 +335,8 @@ class ItemIndexer:
             return IndexOutcome.GONE
         started = await self._start(attempt)
         if isinstance(started, IndexOutcome):
+            if attempt.acknowledgment is not None:
+                await self._acknowledger.send(attempt.acknowledgment)
             return started
         attempt.run = _Run(user_id=attempt.user_id, item_id=attempt.item_id, finished=started)
         await self._run_steps(attempt.run, event)
@@ -362,6 +366,7 @@ class ItemIndexer:
                 # Every try is spent (a run reserved the last one and was then
                 # cancelled, and arq ran the job again). No step runs.
                 item.status = ItemStatus.FAILED
+                attempt.acknowledgment = await claim_collection_acknowledgment(session, item)
                 logger.warning(
                     "saved_item_tries_spent",
                     extra={
@@ -555,13 +560,24 @@ class ItemIndexer:
     async def _confirm(self, run: _Run, event: CaptureEvent, category: str) -> None:
         if run.resume(Step.CONFIRM) is not None:
             return
-        async with self._sessions() as session:
+        async with self._locked(run) as (session, item):
             recipient = await recipient_of(session, run.user_id, event.platform)
             language = await language_of(session, run.user_id)
+            collection = item.collection
+            # Read and marked under the owner's row lock: a collection the chat
+            # worker sets after this is confirmed by its own message (record 0018).
+            await record_step(
+                session,
+                run.item_id,
+                Step.CONFIRM,
+                RunStatus.STARTED,
+                output={"collection_included": collection is not None},
+            )
         confirmation = await self._steps.confirmer.confirm(
             recipient_id=recipient,
             language=language,
             category=category,
+            collection=collection,
             last_user_message_at=event.received_at,
         )
         try:
@@ -570,8 +586,11 @@ class ItemIndexer:
                     session,
                     run.item_id,
                     Step.CONFIRM,
-                    _CONFIRMATION_RUN_STATUS[confirmation.status],
-                    output=confirmation.to_output(),
+                    CONFIRMATION_RUN_STATUS[confirmation.status],
+                    output={
+                        **confirmation.to_output(),
+                        "collection_included": collection is not None,
+                    },
                 )
         except _ItemGoneError:
             return
@@ -653,8 +672,10 @@ class ItemIndexer:
         """Write the item's status and, once a step had started, that step's failure.
 
         A failure before the first step records no step, so every step that
-        already finished stays finished.
+        already finished stays finished. An item failed for good that has a
+        collection gets the collection confirmation, after the commit.
         """
+        acknowledgment: CollectionAcknowledgment | None = None
         try:
             async with self._sessions() as session, session.begin():
                 if not await lock_user(session, attempt.user_id):
@@ -665,6 +686,8 @@ class ItemIndexer:
                 # A run stopped after the item was done (while confirming) leaves it done.
                 if item.status in _RESUMABLE_STATUSES:
                     item.status = item_status
+                    if item_status is ItemStatus.FAILED:
+                        acknowledgment = await claim_collection_acknowledgment(session, item)
                 if attempt.run is not None:
                     await record_step(
                         session,
@@ -673,6 +696,8 @@ class ItemIndexer:
                         RunStatus.FAILED,
                         error=describe(error),
                     )
+            if acknowledgment is not None:
+                await self._acknowledger.send(acknowledgment)
         except (SQLAlchemyError, OSError) as record_error:
             # The database is what failed; the job's own outcome still stands.
             logger.error(

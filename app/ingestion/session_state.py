@@ -8,7 +8,7 @@ erase it by deleting four keys:
 |---|---|---|
 | `payloads` | hash | `capture:<saved item id>`: the `CaptureEvent` an indexing job works on |
 | | | `chat:<receipt id>`: the `ChatMessage` a chat job answers |
-| `receipts` | hash | `<platform>:<message id>`: how a text was routed (`TextReceipt`) |
+| `receipts` | hash | `<platform>:<message id>`: how a text is routed (`TextReceipt`) |
 | `shares` | sorted set | the user's recent shares (`RecordedShare`), scored by send time |
 | `messages` | hash | `last`: the last message number; `<platform>:<message id>`: each number |
 
@@ -67,8 +67,14 @@ _CHAT_PAYLOAD_PREFIX = "chat"
 
 
 class TextRoute(StrEnum):
-    """Where a text went: onto a just-shared item as its collection, or to the response agent."""
+    """Where a text goes: onto a just-shared item as its collection, or to the response agent.
 
+    `UNDECIDED` is a text sent shortly after a share to an item with no
+    collection yet: the chat worker asks the decision model, then keeps
+    `COLLECTION_HINT` or `CHAT` in the receipt (`app.ingestion.text_routing`).
+    """
+
+    UNDECIDED = "undecided"
     COLLECTION_HINT = "collection_hint"
     CHAT = "chat"
 
@@ -76,12 +82,20 @@ class TextRoute(StrEnum):
 class TextReceipt(BaseModel):
     """How one text was routed, kept so a repeated delivery is routed the same way.
 
+    Ingestion writes it first, with the route `CHAT` or `UNDECIDED`; the chat
+    worker writes the decision once. Every text gets a chat job.
+
     Attributes:
         id: The receipt's own id. The chat job and its payload are named after it.
         number: The text's number among the user's messages (`number_message`).
-        route: Where the text went.
-        saved_item_id: The item the text labels, for a collection hint.
-        chat_queued: Whether the chat job was queued, for a chat message.
+        route: Where the text goes.
+        saved_item_id: The share the text may name a collection for (`UNDECIDED`),
+            or the item it labels (`COLLECTION_HINT`); bound by send time at
+            ingestion, never changed afterwards.
+        chat_queued: Whether the chat job was queued.
+        confirm_collection: For a collection hint, whether the item's save
+            confirmation had started without it, so the chat worker sends a
+            collection confirmation of its own.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -91,6 +105,7 @@ class TextReceipt(BaseModel):
     route: TextRoute
     saved_item_id: uuid.UUID | None
     chat_queued: bool
+    confirm_collection: bool = False
 
 
 class RecordedShare(BaseModel):
@@ -323,7 +338,9 @@ class RedisIngestionState:
         await self._write(user_id, _RECEIPTS, field, receipt.model_dump_json())
 
     async def chat_receipt_ids(self, user_id: uuid.UUID) -> list[uuid.UUID]:
-        """Return the receipt ids of the user's texts that were routed to chat.
+        """Return the receipt ids of the user's texts, whatever their route.
+
+        Every text gets a chat job, which decides a collection hint too.
 
         Args:
             user_id: The user.
@@ -335,8 +352,7 @@ class RedisIngestionState:
             redis.exceptions.RedisError: If Redis cannot be reached.
         """
         values = await self._hvals(_key(user_id, _RECEIPTS))
-        receipts = [TextReceipt.model_validate_json(value) for value in values]
-        return [receipt.id for receipt in receipts if receipt.route is TextRoute.CHAT]
+        return [TextReceipt.model_validate_json(value).id for value in values]
 
     async def erase_user(self, user_id: uuid.UUID) -> None:
         """Delete everything ingestion keeps in Redis for a user.

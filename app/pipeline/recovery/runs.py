@@ -17,7 +17,7 @@ from typing import Final
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import EnrichmentRun, PlatformAccount, SavedItem, User
+from app.db.models import EnrichmentRun, ItemStatus, PlatformAccount, SavedItem, User
 
 
 class Step(StrEnum):
@@ -33,11 +33,12 @@ class Step(StrEnum):
 
 
 class RunStatus(StrEnum):
-    """How a step ended."""
+    """How a step ended, or, for the confirmation, that it started to be sent."""
 
     DONE = "done"
     FAILED = "failed"
     SKIPPED = "skipped"
+    STARTED = "started"
 
 
 JsonObject = dict[str, object]
@@ -92,6 +93,67 @@ async def finished_steps(session: AsyncSession, saved_item_id: uuid.UUID) -> dic
         )
     )
     return {Step(row.step): dict(row.output or {}) for row in rows}
+
+
+async def save_confirmation_misses_collection(
+    session: AsyncSession, saved_item_id: uuid.UUID
+) -> bool:
+    """Tell whether a collection set now would be in no save confirmation of the item.
+
+    That is so when the confirmation started to be sent (`confirmation_started`)
+    or the item's indexing failed for good, so none will be sent. Call it under
+    the owner's row lock, which the indexer and the sweeper also hold for both.
+
+    Args:
+        session: The session to work in.
+        saved_item_id: The item.
+
+    Returns:
+        Whether the caller must confirm the collection itself.
+    """
+    status = await session.scalar(select(SavedItem.status).where(SavedItem.id == saved_item_id))
+    return status == ItemStatus.FAILED or await confirmation_started(session, saved_item_id)
+
+
+async def confirmation_started(session: AsyncSession, saved_item_id: uuid.UUID) -> bool:
+    """Tell whether the item's save confirmation started to be sent, whatever came of it.
+
+    The indexer records the start under the owner's row lock, together with
+    reading the item's collection (`ItemIndexer`). A caller that holds the same
+    lock learns whether a collection it sets now still makes it into that
+    confirmation (`False`) or comes too late for it (`True`).
+
+    Args:
+        session: The session to work in.
+        saved_item_id: The item.
+
+    Returns:
+        Whether the item has a row for the confirm step.
+    """
+    rows = await session.execute(
+        select(EnrichmentRun.id).where(
+            EnrichmentRun.saved_item_id == saved_item_id, EnrichmentRun.step == Step.CONFIRM
+        )
+    )
+    return rows.first() is not None
+
+
+async def lock_step(session: AsyncSession, saved_item_id: uuid.UUID, step: Step) -> str | None:
+    """Lock one of the item's step rows `FOR UPDATE` until the transaction ends, and read it.
+
+    Args:
+        session: The session to work in.
+        saved_item_id: The item.
+        step: The step.
+
+    Returns:
+        The step's `RunStatus` value; `None` if the step has no row.
+    """
+    return await session.scalar(
+        select(EnrichmentRun.status)
+        .where(EnrichmentRun.saved_item_id == saved_item_id, EnrichmentRun.step == step)
+        .with_for_update()
+    )
 
 
 async def record_step(

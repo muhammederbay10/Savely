@@ -48,8 +48,10 @@ class Settings(BaseSettings):
             verification handshake (`META_WEBHOOK_VERIFY_TOKEN`). We choose it
             and enter the same value in the Meta app dashboard.
         collection_hint_window_seconds: How long after a share a text from the
-            same user still counts as that item's collection hint
-            (`COLLECTION_HINT_WINDOW_SECONDS`).
+            same user may still name that item's collection
+            (`COLLECTION_HINT_WINDOW_SECONDS`). Only an upper bound: the chat
+            worker asks the decision model about a text inside it, and a
+            later text is chat without a model call (decision record 0018).
         ingestion_state_ttl_seconds: How long ingestion keeps a user's job
             payloads, text receipts and recent shares in Redis after its last
             write (`INGESTION_STATE_TTL_SECONDS`). It must cover the time Meta

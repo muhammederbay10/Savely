@@ -1,9 +1,10 @@
 """The fixed wording of the bot's DMs, in the user's language.
 
-Seven messages have fixed wording: the save confirmation, the "which one?"
-question, import progress, the error message, one line per search result
-(`docs/ARCHITECTURE.md` §3.3 and §3.5, decision record 0004), and the two
-messages of "delete my data": the confirmation question and the final "done". Everything else
+Eight messages have fixed wording: the save confirmation, the collection
+confirmation, the "which one?" question, import progress, the error message,
+one line per search result (`docs/ARCHITECTURE.md` §3.1, §3.3 and §3.5,
+decision records 0004 and 0018), and the two messages of "delete my data": the
+confirmation question and the final "done". Everything else
 the bot says is written by the response agent (SAV-17).
 
 **Caller contract.** Every template takes a `ReplyWording`: the bot's own words
@@ -43,6 +44,8 @@ _LANGUAGE_SUBTAG_SEPARATORS: Final = ("-", "_")
 _PLACEHOLDERS: Final[dict[str, frozenset[str]]] = {
     "saved_named": frozenset({"item"}),
     "saved_as": frozenset({"category"}),
+    "in_collection": frozenset({"collection"}),
+    "saved_to": frozenset({"collection"}),
     "streaming_on": frozenset({"platforms"}),
     "import_progress": frozenset({"done", "total"}),
     "import_progress_with_counts": frozenset({"done", "total", "counts"}),
@@ -84,6 +87,10 @@ class ReplyWording:
             "Saved: {item}".
         saved_as: Confirmation for an item without one; `{category}`, e.g.
             "Saved as {category}".
+        in_collection: The collection, added to the save confirmation;
+            `{collection}`, e.g. "in {collection}".
+        saved_to: The collection confirmation, sent on its own when the save
+            confirmation went out without it; `{collection}`, e.g. "Saved to {collection}".
         streaming_on: Where it streams; `{platforms}`, e.g. "on {platforms}".
         which_one: The "which one?" question, e.g. "Which one did you save?".
         none_of_these: The button for "none of the options".
@@ -105,6 +112,8 @@ class ReplyWording:
 
     saved_named: str
     saved_as: str
+    in_collection: str
+    saved_to: str
     streaming_on: str
     which_one: str
     none_of_these: str
@@ -163,6 +172,8 @@ _BUILT_IN_WORDINGS: Final[dict[str, ReplyWording]] = {
     "en": ReplyWording(
         saved_named="Saved: {item}",
         saved_as="Saved as {category}",
+        in_collection="in {collection}",
+        saved_to="Saved to {collection}",
         streaming_on="on {platforms}",
         which_one="Which one did you save?",
         none_of_these="None of these",
@@ -183,6 +194,8 @@ _BUILT_IN_WORDINGS: Final[dict[str, ReplyWording]] = {
     "tr": ReplyWording(
         saved_named="Kaydedildi: {item}",
         saved_as="{category} olarak kaydedildi",
+        in_collection="{collection} koleksiyonunda",
+        saved_to="{collection} koleksiyonuna kaydedildi",
         streaming_on="{platforms} platformunda",
         which_one="Hangisini kaydettin?",
         none_of_these="Hiçbiri",
@@ -264,6 +277,7 @@ class SavedItemSummary:
         details: Further values to show as given, e.g. ("Sci-fi",) or ("BMW M3",).
         streaming_platforms: Where the item can be streamed, e.g. ("Netflix",).
         emoji: An emoji for the item's kind, e.g. "🎬".
+        collection: The collection the user named for it, e.g. "Food", shown as given.
     """
 
     category: str
@@ -272,6 +286,7 @@ class SavedItemSummary:
     details: tuple[str, ...] = ()
     streaming_platforms: tuple[str, ...] = ()
     emoji: str | None = None
+    collection: str | None = None
 
 
 @dataclass(frozen=True)
@@ -336,7 +351,8 @@ def save_confirmation(summary: SavedItemSummary, wording: ReplyWording) -> Outgo
 
     Returns:
         E.g. "Saved: Inception (2010) · Sci-fi · on Netflix 🎬", or
-        "Saved as 🚗 car review · BMW M3" for an item without a name.
+        "Saved as 🚗 car review · BMW M3 · in Cars" for an item without a name
+        that the user filed in a collection.
     """
     if summary.name is not None:
         item = summary.name if summary.year is None else f"{summary.name} ({summary.year})"
@@ -347,10 +363,25 @@ def save_confirmation(summary: SavedItemSummary, wording: ReplyWording) -> Outgo
     if summary.streaming_platforms:
         platforms = wording.list_separator.join(summary.streaming_platforms)
         parts.append(wording.streaming_on.format(platforms=platforms))
+    if summary.collection is not None:
+        parts.append(wording.in_collection.format(collection=summary.collection))
     text = SEPARATOR.join(parts)
     if summary.name is not None and summary.emoji is not None:
         text = f"{text} {summary.emoji}"
     return OutgoingMessage(text=text)
+
+
+def collection_confirmation(collection: str, wording: ReplyWording) -> OutgoingMessage:
+    """Build the DM that confirms the collection of an item whose save was already confirmed.
+
+    Args:
+        collection: The collection, as the user wrote it, e.g. "Food".
+        wording: The bot's words in the user's language, from `reply_wording`.
+
+    Returns:
+        E.g. "Saved to Food".
+    """
+    return OutgoingMessage(text=wording.saved_to.format(collection=collection))
 
 
 def which_one_question(

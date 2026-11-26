@@ -230,7 +230,8 @@ async def test_logs_hold_no_message_content_or_platform_ids_even_at_debug_level(
     async with session_factory() as session:
         item = (await session.execute(select(SavedItem))).scalar_one()
     logged = "\n".join(f"{record.getMessage()} {record.__dict__}" for record in caplog.records)
-    assert item.collection == "For my movies collection"
+    # The hint is decided later by the chat worker; the webhook only binds it.
+    assert item.collection is None
     assert "capture_ingested" in logged
     assert "chat_message_ingested" in logged
     assert [value for value in private_values if value in logged] == []

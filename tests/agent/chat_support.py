@@ -35,12 +35,15 @@ from app.db.models import (
 )
 from app.ingestion.erasure import IngestionDataEraser
 from app.ingestion.jobs import CHAT_QUEUE, INDEXING_QUEUE, ArqJobQueue
+from app.ingestion.prompts import ROUTING_PROMPTS
 from app.ingestion.service import IngestionService
 from app.ingestion.session_state import RedisIngestionState
+from app.ingestion.text_routing import TextRouter
 from app.memory.conversation import ConversationStore
 from app.memory.session import SessionMemory
-from app.models.base import GenerationResult
+from app.models.base import Classifier, GenerationResult
 from app.models.errors import ModelError
+from app.models.fakes import FakeClassifier
 from app.pipeline.media.storage import LocalMediaStore
 from tests.agent.agent_support import AgentUnderTest, FakeClock, build_agent
 from tests.agent.retrieval_support import BEBEK, place_fields
@@ -49,6 +52,8 @@ from tests.agent.support import RecordingSendApi, build_messenger, sent
 from tests.db_factories import INSTAGRAM
 
 HINT_WINDOW = timedelta(seconds=30)
+HINT_MIN_PROBABILITY = 0.8
+ROUTING_TIMEOUT_SECONDS = 5.0
 SESSION_LIFETIME = timedelta(hours=24)
 HISTORY_MESSAGES = 20
 RUN_DEADLINE_SECONDS = 10.0
@@ -93,15 +98,24 @@ class ChatStores:
         return user_id
 
     async def send_text(
-        self, user_id: uuid.UUID, text: str, *, quick_reply_payload: str | None = None
+        self,
+        user_id: uuid.UUID,
+        text: str,
+        *,
+        quick_reply_payload: str | None = None,
+        sent_at: datetime | None = None,
     ) -> uuid.UUID:
-        """The user writes to the bot; ingestion queues the chat job. Returns its receipt id."""
+        """The user writes to the bot; ingestion queues the chat job. Returns its receipt id.
+
+        Without `sent_at`, the text is sent a minute after the last message, so
+        it is never bound to a share.
+        """
         message = ChatMessage(
             user_id=user_id,
             platform=INSTAGRAM,
             text=text,
             message_id=f"mid-synthetic-{uuid.uuid4().hex}",
-            received_at=self._next_send_time(),
+            received_at=sent_at or self._next_send_time(),
             quick_reply_payload=quick_reply_payload,
         )
         receipt_id = await self._ingest(message)
@@ -207,9 +221,19 @@ def build_chat(
     script: Sequence[GenerationResult | ModelError],
     *,
     send_answers: Sequence[httpx.Response | Exception] | None = None,
+    routing_model: Classifier | None = None,
+    routing_sessions: async_sessionmaker[AsyncSession] | None = None,
+    routing_timeout_seconds: float = ROUTING_TIMEOUT_SECONDS,
+    routing_min_probability: float = HINT_MIN_PROBABILITY,
+    run_deadline_seconds: float = RUN_DEADLINE_SECONDS,
     **agent_settings: int,
 ) -> ChatUnderTest:
-    """The responder with the real tools and stores, a scripted text model and a mock Send API."""
+    """The responder with the real tools and stores, a scripted text model and a mock Send API.
+
+    `routing_model` decides whether a text right after a share names a
+    collection; by default it answers nothing, so every such text is chat.
+    `routing_sessions` lets a test make the routing's database writes fail.
+    """
     agent = build_agent(
         stores.sessions,
         script,
@@ -222,12 +246,20 @@ def build_chat(
     sender = AnswerSender(messenger.messenger)
     responder = ChatResponder(
         payloads=ChatPayloads(stores.state),
+        routes=TextRouter(
+            routing_sessions or stores.sessions,
+            stores.state,
+            routing_model or FakeClassifier(),
+            ROUTING_PROMPTS,
+            min_probability=routing_min_probability,
+            decision_timeout_seconds=routing_timeout_seconds,
+        ),
         memory=stores.memory,
         conversations=ConversationStore(stores.sessions),
         agent=agent.agent,
         toolbox=agent.toolbox,
         sender=sender,
-        run_deadline_seconds=RUN_DEADLINE_SECONDS,
+        run_deadline_seconds=run_deadline_seconds,
         store_tries=STORE_TRIES,
         store_retry_delay_seconds=STORE_RETRY_DELAY_SECONDS,
         now=stores.clock,

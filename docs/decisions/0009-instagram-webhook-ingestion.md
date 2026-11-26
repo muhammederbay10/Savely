@@ -2,6 +2,7 @@
 
 - Status: proposed with SAV-11. It takes effect when SAV-11's pull request is merged. The points under [For Muhammed](#for-muhammed) are choices made inside the ticket's scope that he may want to change.
 - Date: 2026-11-17, revised 2026-11-18 after the first and second reviews (points 3–5, 7, 13 and 14)
+- Superseded in part: point 7's time-only route and Q1 are replaced by record [0018](0018-model-decides-collection-hints.md) (SAV-39). The webhook binds a text to the share sent before it and queues it; the chat worker asks the decision model whether it names a collection. The share history and receipts stay.
 - Ticket: SAV-11 (0008 is SAV-7's record on model choices)
 
 ## Context

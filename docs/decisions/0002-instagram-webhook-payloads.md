@@ -2,6 +2,7 @@
 
 - Status: findings recorded. Points 1–3 under [Consequences](#consequences) need Muhammed's decision before SAV-11 and SAV-14 build on them.
 - Date: 2026-11-16
+- Superseded in part: the time-only collection hint (the last adapter point of consequence 4) is replaced by record [0018](0018-model-decides-collection-hints.md) (SAV-39): the window is only an upper bound, and the decision model decides.
 - Ticket: SAV-5 (the ticket asked for `0001-…`; that number was taken by the SAV-4 scaffold record, so this is `0002`)
 
 ## Context

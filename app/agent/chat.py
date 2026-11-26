@@ -2,31 +2,38 @@
 
 For each text the user wrote to the bot:
 
-1. Read the message and its number from ingestion's state in Redis; no
+1. Read the message and its receipt from ingestion's state in Redis; no
    message means the user was deleted, and the job stops.
-2. Load the sender's profile (their platform id, country and home area) and
-   their short-term memory (the last messages and the working set).
-3. Run the response agent for that user only. The user comes from the DM's
+2. Load the sender's profile (their platform id, country, home area and
+   language), then settle the text's route (`app.ingestion.text_routing`,
+   decision record 0018): a text sent right after a share may name that post's
+   collection, and the decision model decides once. A collection hint is not
+   answered: the item's save confirmation will name the collection, or, if it
+   had already started without it, the job sends one short collection
+   confirmation in the user's language ("Saved to Food"), never twice.
+3. For chat, load the sender's short-term memory (the last messages and the
+   working set).
+4. Run the response agent for that user only. The user comes from the DM's
    sender, never from the model. `AgentTurn.deletion_confirmed` is set only
    when the message is a tap on the "Yes, delete" button
    (`confirms_deletion`), and `AgentTurn.message_number` lets only the
    sender's next message after a delivered question confirm it. A typed
    "yes", a tap after another message (whatever order the jobs run in) or
    another user's tap deletes nothing.
-4. Send the answer within the 24-hour window, counted from when the user
+5. Send the answer within the 24-hour window, counted from when the user
    sent this message; a deletion question's request is planned before
    (`app.agent.send.deletion_request`) and stored with the exchange.
-5. Store the exchange: the messages and the new working set in short-term
+6. Store the exchange: the messages and the new working set in short-term
    memory (`app/memory/session.py`), the messages in `conversation_msg` and
    the user's language (`app/memory/conversation.py`).
 
-**One answer at a time per sender** (owner decision of 22 Nov 2026). Steps 4
-and 5 run inside `ConversationStore.one_answer_at_a_time`, so the sender's
+**One answer at a time per sender** (owner decision of 22 Nov 2026). Steps 5
+and 6 run inside `ConversationStore.one_answer_at_a_time`, so the sender's
 next answer is sent only once this one was sent and stored, and the working
-set always holds the list the user saw last. The agent runs (step 3) still
+set always holds the list the user saw last. The agent runs (step 4) still
 overlap, and other users never wait.
 
-**"Delete my data" never races an answer.** Step 4 and every write of step 5
+**"Delete my data" never races an answer.** Step 5 and every write of step 6
 run inside `ConversationStore.hold`, which holds the user's row the erasure
 locks too, and only if the user still exists. An answer whose user was
 deleted before it got there is not sent and stores nothing; an erasure that
@@ -34,7 +41,7 @@ starts while an answer is being sent or stored waits for it, then erases what
 it stored. Only the "done" message after a deletion is sent without the user,
 to the recipients read before the erasure.
 
-**Retries before sending.** Steps 1 to 3 have `CHAT_RUN_DEADLINE_SECONDS`. A
+**Retries before sending.** Steps 1 to 4 have `CHAT_RUN_DEADLINE_SECONDS`. A
 failure there that may pass later (a model outage, the deadline, Redis or the
 database) raises `RetryLaterError`, and the worker tries the job again; on the
 last try the bot sends its error message instead. A failure that would happen
@@ -83,12 +90,14 @@ from app.agent.replies.messenger import MessengerError
 from app.agent.replies.templates import (
     ReplyWording,
     ReplyWordingUnavailableError,
+    collection_confirmation,
     confirms_deletion,
     reply_wording,
 )
 from app.agent.send import deletion_request
 from app.agent.tools import Toolbox
-from app.ingestion.session_state import RedisIngestionState
+from app.ingestion.session_state import RedisIngestionState, TextReceipt, TextRoute
+from app.ingestion.text_routing import TextRouter
 from app.memory.conversation import ChatProfile, ConversationStore
 from app.memory.session import (
     Exchange,
@@ -124,6 +133,8 @@ class ChatOutcome(StrEnum):
     """What one try of a chat job did."""
 
     ANSWERED = "answered"
+    COLLECTION_HINT = "collection_hint"
+    COLLECTION_CONFIRMED = "collection_confirmed"
     OUTSIDE_REPLY_WINDOW = "outside_reply_window"
     NO_MESSAGE = "no_message"
     NO_USER = "no_user"
@@ -143,15 +154,20 @@ def _utc_now() -> datetime:
 
 @dataclass(frozen=True)
 class ReceivedMessage:
-    """A chat message with its number among the sender's messages.
+    """A chat message with its receipt from ingestion.
 
     Attributes:
         message: The message.
-        number: Its number, given by ingestion in the order messages arrived.
+        receipt: How ingestion routed it, with its number among the sender's messages.
     """
 
     message: ChatMessage
-    number: int
+    receipt: TextReceipt
+
+    @property
+    def number(self) -> int:
+        """Return its number, given by ingestion in the order messages arrived."""
+        return self.receipt.number
 
 
 class ChatPayloads:
@@ -166,7 +182,7 @@ class ChatPayloads:
         self._state = state
 
     async def message(self, user_id: uuid.UUID, receipt_id: uuid.UUID) -> ReceivedMessage | None:
-        """Return the message of a chat job and its number, if they are still kept.
+        """Return the message of a chat job and its receipt, if they are still kept.
 
         Args:
             user_id: The sender.
@@ -182,7 +198,7 @@ class ChatPayloads:
         if message is None:
             return None
         receipt = await self._state.text_receipt(user_id, message.platform, message.message_id)
-        return None if receipt is None else ReceivedMessage(message, receipt.number)
+        return None if receipt is None else ReceivedMessage(message, receipt)
 
     async def last_message_number(self, user_id: uuid.UUID) -> int:
         """Return the number of the sender's last message, 0 if none is known.
@@ -208,6 +224,17 @@ class _Prepared:
     received: ReceivedMessage
     profile: ChatProfile
     session: Session
+
+
+@dataclass(frozen=True)
+class _Labelled:
+    """A text that names the collection of the post shared before it."""
+
+    user_id: uuid.UUID
+    receipt_id: uuid.UUID
+    received: ReceivedMessage
+    profile: ChatProfile
+    receipt: TextReceipt
 
 
 @dataclass(frozen=True)
@@ -237,6 +264,7 @@ class ChatResponder:
         self,
         *,
         payloads: ChatPayloads,
+        routes: TextRouter,
         memory: SessionMemory,
         conversations: ConversationStore,
         agent: ResponseAgent,
@@ -252,6 +280,7 @@ class ChatResponder:
 
         Args:
             payloads: Reads the message of a job.
+            routes: Settles whether a text names a collection or is chat.
             memory: Short-term memory: history, working set, reply marks.
             conversations: The profile and `conversation_msg`, and the hold on the user.
             agent: The response agent.
@@ -271,6 +300,7 @@ class ChatResponder:
         if store_tries < 1:
             raise ValueError("store_tries must be at least 1")
         self._payloads = payloads
+        self._routes = routes
         self._memory = memory
         self._conversations = conversations
         self._agent = agent
@@ -307,6 +337,8 @@ class ChatResponder:
             return await self._retry_or_fail(None, error, last_try=last_try)
         if isinstance(step, ChatOutcome):
             return step
+        if isinstance(step, _Labelled):
+            return await self._confirm_collection(step, last_try=last_try)
         if isinstance(step, _Sent):
             # An earlier try sent the answer; only storing it is left.
             return await self._store_sent(user_id, receipt_id, step, last_try=last_try)
@@ -321,7 +353,7 @@ class ChatResponder:
 
     async def _prepare(
         self, user_id: uuid.UUID, receipt_id: uuid.UUID
-    ) -> _Prepared | _Sent | ChatOutcome:
+    ) -> _Prepared | _Labelled | _Sent | ChatOutcome:
         received = await self._payloads.message(user_id, receipt_id)
         if received is None:
             return ChatOutcome.NO_MESSAGE
@@ -331,6 +363,11 @@ class ChatResponder:
         profile = await self._conversations.profile(user_id, received.message.platform)
         if profile is None:
             return ChatOutcome.NO_USER
+        routed = await self._routes.settle(user_id, received.message, received.receipt)
+        if routed is None:
+            return ChatOutcome.NO_USER
+        if routed.route is TextRoute.COLLECTION_HINT:
+            return _Labelled(user_id, receipt_id, received, profile, routed)
         session = await self._memory.load(user_id)
         return _Prepared(user_id, receipt_id, received, profile, session)
 
@@ -351,6 +388,44 @@ class ChatResponder:
         if stored == 0:
             return ChatOutcome.ALREADY_SENT
         return _Sent(reply.planned, sent_whole=stored == planned_messages, order=reply.order)
+
+    async def _confirm_collection(self, labelled: _Labelled, *, last_try: bool) -> ChatOutcome:
+        """Confirm the collection with a message of its own, if the save confirmation missed it.
+
+        The reply mark makes it go out once, like an answer; the text itself is
+        not part of the conversation the agent reads.
+        """
+        if not labelled.receipt.confirm_collection:
+            return ChatOutcome.COLLECTION_HINT
+        message = labelled.received.message
+        confirmation = collection_confirmation(message.text, _wording_in(labelled.profile.language))
+        try:
+            async with (
+                self._conversations.one_answer_at_a_time(labelled.user_id) as conversations,
+                conversations.hold(labelled.user_id) as held,
+            ):
+                if held is None:
+                    return ChatOutcome.NO_USER
+                started = await self._memory.start_reply(
+                    labelled.user_id, labelled.receipt_id, None
+                )
+                if started is None:
+                    return ChatOutcome.ALREADY_SENT
+                try:
+                    await self._sender.send(
+                        labelled.profile.recipient_id,
+                        AnswerMessages(intro=confirmation.text, results=(), wording=None),
+                        message.received_at,
+                    )
+                except MessengerError as error:
+                    logger.warning(
+                        "collection_confirmation_failed", extra={"error": type(error).__name__}
+                    )
+                    return ChatOutcome.SEND_FAILED
+        except RETRYABLE_ERRORS as error:
+            # The mark is written right before sending; a later try that finds it sends nothing.
+            return await self._retry_or_fail(None, error, last_try=last_try)
+        return ChatOutcome.COLLECTION_CONFIRMED
 
     async def _retry_or_fail(
         self, prepared: _Prepared | None, error: Exception, *, last_try: bool
@@ -525,7 +600,7 @@ class ChatResponder:
                 return ChatOutcome.NO_USER
             if await self._memory.start_reply(prepared.user_id, prepared.receipt_id, None) is None:
                 return ChatOutcome.ALREADY_SENT
-            wording = _error_wording(prepared.profile.language)
+            wording = _wording_in(prepared.profile.language)
             try:
                 await self._sender.send(
                     prepared.profile.recipient_id,
@@ -565,8 +640,8 @@ def _turn(prepared: _Prepared) -> AgentTurn:
     )
 
 
-def _error_wording(language: str | None) -> ReplyWording:
-    """Return the error wording in the user's language, or the fallback language."""
+def _wording_in(language: str | None) -> ReplyWording:
+    """Return the bot's fixed wording in the user's language, or the fallback language."""
     if language is not None:
         try:
             return reply_wording(language)

@@ -1,4 +1,4 @@
-"""Ingestion: first contact, saved items and their dedupe keys, collection hints, jobs.
+"""Ingestion: first contact, saved items and their dedupe keys, texts bound to shares, jobs.
 
 These tests need Postgres with PostGIS and pgvector. See `tests/database.py`.
 All ids, links and texts are synthetic.
@@ -19,7 +19,7 @@ from app.adapters.base import CaptureEvent, ChatMessage
 from app.db.models import ItemStatus, PlatformAccount, SavedItem, User
 from app.ingestion.jobs import ANSWER_CHAT_MESSAGE_JOB, INDEX_SAVED_ITEM_JOB
 from app.ingestion.service import IngestionOutcome, IngestionService, UnknownUserError
-from app.ingestion.session_state import RedisIngestionState
+from app.ingestion.session_state import RedisIngestionState, TextReceipt, TextRoute
 from tests.db_factories import (
     INSTAGRAM,
     MESSAGE_ID,
@@ -136,6 +136,14 @@ async def saved_items(session_factory: async_sessionmaker[AsyncSession]) -> list
 async def only_saved_item(session_factory: async_sessionmaker[AsyncSession]) -> SavedItem:
     (item,) = await saved_items(session_factory)
     return item
+
+
+async def receipt_of(
+    state: RedisIngestionState, user_id: uuid.UUID, message_id: str = HINT_MESSAGE_ID
+) -> TextReceipt:
+    receipt = await state.text_receipt(user_id, INSTAGRAM, message_id)
+    assert receipt is not None
+    return receipt
 
 
 async def count(session_factory: async_sessionmaker[AsyncSession], model: type) -> int:
@@ -400,54 +408,61 @@ async def test_item_whose_job_could_not_be_queued_is_queued_when_the_share_is_re
     assert [job.job_id for job in job_queue.jobs] == [f"index:{item.id}"]
 
 
-# --- Collection hints and chat -----------------------------------------------
+# --- Texts: bound to a share by send time, decided by the chat worker ------------
 
 
-async def test_text_right_after_a_share_becomes_that_items_collection_hint(
+async def test_text_right_after_a_share_is_bound_to_that_item_and_queued_for_the_chat_worker(
     ingestion: IngestionService,
     session_factory: async_sessionmaker[AsyncSession],
     job_queue: RecordingJobQueue,
+    ingestion_state: RedisIngestionState,
     user_id: uuid.UUID,
 ) -> None:
     await ingestion.ingest_capture(reel_share(user_id))
 
     outcome = await ingestion.ingest_chat_message(text_message(user_id))
 
+    # No model call and no label here: the chat worker decides (decision record 0018).
     item = await only_saved_item(session_factory)
-    assert outcome is IngestionOutcome.COLLECTION_HINT
-    assert item.collection == HINT
-    assert job_queue.named(ANSWER_CHAT_MESSAGE_JOB) == []
+    receipt = await receipt_of(ingestion_state, user_id)
+    assert outcome is IngestionOutcome.CHAT_QUEUED
+    assert (receipt.route, receipt.saved_item_id) == (TextRoute.UNDECIDED, item.id)
+    assert item.collection is None
+    (job,) = job_queue.named(ANSWER_CHAT_MESSAGE_JOB)
+    assert job.arguments["message_receipt_id"] == str(receipt.id)
 
 
-async def test_text_after_a_collection_save_becomes_its_collection_hint(
+async def test_text_after_a_collection_save_is_bound_to_it(
     ingestion: IngestionService,
     session_factory: async_sessionmaker[AsyncSession],
+    ingestion_state: RedisIngestionState,
     user_id: uuid.UUID,
 ) -> None:
     await ingestion.ingest_capture(collection_save(user_id, MESSAGE_ID))
 
-    outcome = await ingestion.ingest_chat_message(text_message(user_id))
+    await ingestion.ingest_chat_message(text_message(user_id))
 
-    assert outcome is IngestionOutcome.COLLECTION_HINT
-    assert (await only_saved_item(session_factory)).collection == HINT
+    receipt = await receipt_of(ingestion_state, user_id)
+    assert receipt.saved_item_id == (await only_saved_item(session_factory)).id
 
 
-async def test_text_at_the_end_of_the_window_is_still_a_hint(
+async def test_text_at_the_end_of_the_window_is_still_bound(
     ingestion: IngestionService,
-    session_factory: async_sessionmaker[AsyncSession],
+    ingestion_state: RedisIngestionState,
     user_id: uuid.UUID,
 ) -> None:
     await ingestion.ingest_capture(reel_share(user_id))
 
-    outcome = await ingestion.ingest_chat_message(text_message(user_id, sent_after=HINT_WINDOW))
+    await ingestion.ingest_chat_message(text_message(user_id, sent_after=HINT_WINDOW))
 
-    assert outcome is IngestionOutcome.COLLECTION_HINT
+    assert (await receipt_of(ingestion_state, user_id)).route is TextRoute.UNDECIDED
 
 
-async def test_text_after_the_window_is_a_chat_message(
+async def test_text_after_the_window_is_chat_with_no_share_to_decide_about(
     ingestion: IngestionService,
     session_factory: async_sessionmaker[AsyncSession],
     job_queue: RecordingJobQueue,
+    ingestion_state: RedisIngestionState,
     user_id: uuid.UUID,
 ) -> None:
     await ingestion.ingest_capture(reel_share(user_id))
@@ -457,7 +472,10 @@ async def test_text_after_the_window_is_a_chat_message(
         text_message(user_id, text=QUESTION, sent_after=just_too_late)
     )
 
+    # The window is the upper bound: the chat worker makes no model call for it.
+    receipt = await receipt_of(ingestion_state, user_id)
     assert outcome is IngestionOutcome.CHAT_QUEUED
+    assert (receipt.route, receipt.saved_item_id) == (TextRoute.CHAT, None)
     assert (await only_saved_item(session_factory)).collection is None
     assert len(job_queue.named(ANSWER_CHAT_MESSAGE_JOB)) == 1
 
@@ -472,10 +490,10 @@ async def test_window_length_comes_from_the_service_setting(
     ingestion = IngestionService(session_factory, job_queue, ingestion_state, short_window)
     await ingestion.ingest_capture(reel_share(user_id))
 
-    outcome = await ingestion.ingest_chat_message(text_message(user_id))
+    await ingestion.ingest_chat_message(text_message(user_id))
 
     assert short_window < RECORDED_HINT_DELAY
-    assert outcome is IngestionOutcome.CHAT_QUEUED
+    assert (await receipt_of(ingestion_state, user_id)).route is TextRoute.CHAT
 
 
 async def test_text_from_a_user_without_a_capture_is_a_chat_message(
@@ -500,7 +518,7 @@ async def test_text_from_a_user_without_a_capture_is_a_chat_message(
 
 async def test_text_sent_before_the_share_is_a_chat_message(
     ingestion: IngestionService,
-    session_factory: async_sessionmaker[AsyncSession],
+    ingestion_state: RedisIngestionState,
     user_id: uuid.UUID,
 ) -> None:
     await ingestion.ingest_capture(reel_share(user_id))
@@ -510,19 +528,21 @@ async def test_text_sent_before_the_share_is_a_chat_message(
     )
 
     assert outcome is IngestionOutcome.CHAT_QUEUED
-    assert (await only_saved_item(session_factory)).collection is None
+    assert (await receipt_of(ingestion_state, user_id)).route is TextRoute.CHAT
 
 
-async def test_second_text_in_the_window_is_a_chat_message_and_keeps_the_first_hint(
+async def test_two_texts_in_the_window_are_both_bound_and_both_queued(
     ingestion: IngestionService,
     session_factory: async_sessionmaker[AsyncSession],
     job_queue: RecordingJobQueue,
+    ingestion_state: RedisIngestionState,
     user_id: uuid.UUID,
 ) -> None:
+    # Which one names the collection is the chat worker's decision; the first wins.
     await ingestion.ingest_capture(reel_share(user_id))
     await ingestion.ingest_chat_message(text_message(user_id))
 
-    outcome = await ingestion.ingest_chat_message(
+    await ingestion.ingest_chat_message(
         text_message(
             user_id,
             text=QUESTION,
@@ -531,30 +551,34 @@ async def test_second_text_in_the_window_is_a_chat_message_and_keeps_the_first_h
         )
     )
 
-    assert outcome is IngestionOutcome.CHAT_QUEUED
-    assert (await only_saved_item(session_factory)).collection == HINT
-    assert len(job_queue.named(ANSWER_CHAT_MESSAGE_JOB)) == 1
+    item = await only_saved_item(session_factory)
+    first = await receipt_of(ingestion_state, user_id)
+    second = await receipt_of(ingestion_state, user_id, QUESTION_MESSAGE_ID)
+    assert first.saved_item_id == second.saved_item_id == item.id
+    assert len(job_queue.named(ANSWER_CHAT_MESSAGE_JOB)) == 2
 
 
-async def test_redelivered_hint_stays_a_hint_and_starts_no_chat(
+async def test_redelivered_bound_text_keeps_its_receipt_and_is_queued_once(
     ingestion: IngestionService,
-    session_factory: async_sessionmaker[AsyncSession],
     job_queue: RecordingJobQueue,
+    ingestion_state: RedisIngestionState,
     user_id: uuid.UUID,
 ) -> None:
     await ingestion.ingest_capture(reel_share(user_id))
-    await ingestion.ingest_chat_message(text_message(user_id))
+    first = await ingestion.ingest_chat_message(text_message(user_id))
+    receipt = await receipt_of(ingestion_state, user_id)
 
-    outcome = await ingestion.ingest_chat_message(text_message(user_id))
+    replay = await ingestion.ingest_chat_message(text_message(user_id))
 
-    assert outcome is IngestionOutcome.COLLECTION_HINT
-    assert (await only_saved_item(session_factory)).collection == HINT
-    assert job_queue.named(ANSWER_CHAT_MESSAGE_JOB) == []
+    assert (first, replay) == (IngestionOutcome.CHAT_QUEUED, IngestionOutcome.CHAT_ALREADY_QUEUED)
+    assert await receipt_of(ingestion_state, user_id) == receipt
+    assert len(job_queue.named(ANSWER_CHAT_MESSAGE_JOB)) == 1
 
 
-async def test_hint_goes_to_the_latest_capture_only(
+async def test_text_is_bound_to_the_latest_capture_only(
     ingestion: IngestionService,
     session_factory: async_sessionmaker[AsyncSession],
+    ingestion_state: RedisIngestionState,
     user_id: uuid.UUID,
 ) -> None:
     await ingestion.ingest_capture(collection_save(user_id, MESSAGE_ID))
@@ -564,14 +588,14 @@ async def test_hint_goes_to_the_latest_capture_only(
 
     await ingestion.ingest_chat_message(text_message(user_id))
 
-    earlier, latest = await saved_items(session_factory)
-    assert earlier.collection is None
-    assert latest.collection == HINT
+    _, latest = await saved_items(session_factory)
+    assert (await receipt_of(ingestion_state, user_id)).saved_item_id == latest.id
 
 
-async def test_hint_never_reaches_another_users_capture(
+async def test_text_is_never_bound_to_another_users_capture(
     ingestion: IngestionService,
     session_factory: async_sessionmaker[AsyncSession],
+    ingestion_state: RedisIngestionState,
     user_id: uuid.UUID,
 ) -> None:
     other_user_id = await ingestion.resolve_user(INSTAGRAM, OTHER_SENDER_ID)
@@ -579,7 +603,9 @@ async def test_hint_never_reaches_another_users_capture(
 
     outcome = await ingestion.ingest_chat_message(text_message(other_user_id))
 
+    receipt = await receipt_of(ingestion_state, other_user_id)
     assert outcome is IngestionOutcome.CHAT_QUEUED
+    assert (receipt.route, receipt.saved_item_id) == (TextRoute.CHAT, None)
     assert (await only_saved_item(session_factory)).collection is None
 
 
@@ -650,9 +676,10 @@ async def item_with_post_id(
         return (await session.execute(statement)).scalar_one()
 
 
-async def test_hint_after_a_repeated_share_labels_the_repeated_post_not_a_later_saved_one(
+async def test_text_after_a_repeated_share_is_bound_to_the_repeated_post_not_a_later_saved_one(
     ingestion: IngestionService,
     session_factory: async_sessionmaker[AsyncSession],
+    ingestion_state: RedisIngestionState,
     user_id: uuid.UUID,
 ) -> None:
     await ingestion.ingest_capture(
@@ -675,16 +702,14 @@ async def test_hint_after_a_repeated_share_labels_the_repeated_post_not_a_later_
         )
     )
 
-    outcome = await ingestion.ingest_chat_message(
+    await ingestion.ingest_chat_message(
         text_message(user_id, message_id=LATE_HINT_MESSAGE_ID, sent_after=timedelta(seconds=70))
     )
 
     post_a = await item_with_post_id(session_factory, POST_A)
-    post_b = await item_with_post_id(session_factory, POST_B)
+    receipt = await receipt_of(ingestion_state, user_id, LATE_HINT_MESSAGE_ID)
     assert repeat is IngestionOutcome.ITEM_ALREADY_SAVED
-    assert outcome is IngestionOutcome.COLLECTION_HINT
-    assert post_a.collection == HINT
-    assert post_b.collection is None
+    assert receipt.saved_item_id == post_a.id
     # The item keeps the message it came in with, so answers still reply to it.
     assert post_a.source_message_id == SHARE_A_MESSAGE_ID
     assert post_a.saved_at == SHARED_AT
@@ -731,10 +756,11 @@ async def test_text_whose_chat_job_failed_to_queue_keeps_its_route_on_redelivery
     assert len(job_queue.named(ANSWER_CHAT_MESSAGE_JOB)) == 1
 
 
-async def test_redelivered_hint_stays_on_its_item_after_a_delayed_share(
+async def test_redelivered_text_stays_bound_to_its_item_after_a_delayed_share(
     ingestion: IngestionService,
     session_factory: async_sessionmaker[AsyncSession],
     job_queue: RecordingJobQueue,
+    ingestion_state: RedisIngestionState,
     user_id: uuid.UUID,
 ) -> None:
     await ingestion.ingest_capture(reel_share(user_id))
@@ -753,11 +779,9 @@ async def test_redelivered_hint_stays_on_its_item_after_a_delayed_share(
     replay = await ingestion.ingest_chat_message(hint)
 
     first_item = await item_with_post_id(session_factory, REEL_ID)
-    later_item = await item_with_post_id(session_factory, OTHER_REEL_ID)
-    assert replay is IngestionOutcome.COLLECTION_HINT
-    assert first_item.collection == HINT
-    assert later_item.collection is None
-    assert job_queue.named(ANSWER_CHAT_MESSAGE_JOB) == []
+    assert replay is IngestionOutcome.CHAT_ALREADY_QUEUED
+    assert (await receipt_of(ingestion_state, user_id)).saved_item_id == first_item.id
+    assert len(job_queue.named(ANSWER_CHAT_MESSAGE_JOB)) == 1
 
 
 @pytest.mark.parametrize("message_kind", ["capture", "text"])
@@ -809,10 +833,10 @@ def photo_post_share(user_id: uuid.UUID, message_id: str, **overrides: object) -
     return reel_share(user_id, **{**values, **overrides})
 
 
-async def test_delayed_hint_labels_the_share_sent_before_it_not_a_later_one(
+async def test_delayed_text_is_bound_to_the_share_sent_before_it_not_a_later_one(
     ingestion: IngestionService,
     session_factory: async_sessionmaker[AsyncSession],
-    job_queue: RecordingJobQueue,
+    ingestion_state: RedisIngestionState,
     user_id: uuid.UUID,
 ) -> None:
     # Sent: A at 0 s, the hint at 10 s, B at 20 s. Delivered: A, B, then the hint.
@@ -829,23 +853,21 @@ async def test_delayed_hint_labels_the_share_sent_before_it_not_a_later_one(
     )
     hint = text_message(user_id, message_id=LATE_HINT_MESSAGE_ID, sent_after=timedelta(seconds=10))
 
-    outcome = await ingestion.ingest_chat_message(hint)
-    replay = await ingestion.ingest_chat_message(hint)
+    await ingestion.ingest_chat_message(hint)
+    await ingestion.ingest_chat_message(hint)
 
     post_a = await item_with_post_id(session_factory, POST_A)
-    post_b = await item_with_post_id(session_factory, POST_B)
-    assert (outcome, replay) == (IngestionOutcome.COLLECTION_HINT, IngestionOutcome.COLLECTION_HINT)
-    assert post_a.collection == HINT
-    assert post_b.collection is None
-    assert job_queue.named(ANSWER_CHAT_MESSAGE_JOB) == []
+    receipt = await receipt_of(ingestion_state, user_id, LATE_HINT_MESSAGE_ID)
+    assert receipt.saved_item_id == post_a.id
 
 
-async def test_delayed_hint_whose_earlier_share_is_labelled_stays_chat_and_skips_older_shares(
+async def test_text_whose_share_already_has_a_collection_is_chat_and_skips_older_shares(
     ingestion: IngestionService,
     session_factory: async_sessionmaker[AsyncSession],
+    ingestion_state: RedisIngestionState,
     user_id: uuid.UUID,
 ) -> None:
-    # One item per hint: an earlier share in the window doesn't take over.
+    # One item per text: an earlier share in the window doesn't take over.
     await ingestion.ingest_capture(
         reel_share(user_id, platform_post_id=POST_A, source_message_id=SHARE_A_MESSAGE_ID)
     )
@@ -857,11 +879,12 @@ async def test_delayed_hint_whose_earlier_share_is_labelled_stays_chat_and_skips
             received_at=SHARED_AT + timedelta(seconds=5),
         )
     )
-    await ingestion.ingest_chat_message(
-        text_message(user_id, message_id=HINT_MESSAGE_ID, sent_after=timedelta(seconds=8))
-    )
+    async with session_factory.begin() as session:
+        await session.execute(
+            update(SavedItem).where(SavedItem.platform_post_id == POST_B).values(collection=HINT)
+        )
 
-    outcome = await ingestion.ingest_chat_message(
+    await ingestion.ingest_chat_message(
         text_message(
             user_id,
             text=QUESTION,
@@ -870,9 +893,8 @@ async def test_delayed_hint_whose_earlier_share_is_labelled_stays_chat_and_skips
         )
     )
 
-    assert outcome is IngestionOutcome.CHAT_QUEUED
-    assert (await item_with_post_id(session_factory, POST_A)).collection is None
-    assert (await item_with_post_id(session_factory, POST_B)).collection == HINT
+    receipt = await receipt_of(ingestion_state, user_id, LATE_HINT_MESSAGE_ID)
+    assert (receipt.route, receipt.saved_item_id) == (TextRoute.CHAT, None)
 
 
 async def test_replayed_old_share_keeps_the_fresh_media_link_of_a_later_share(
@@ -922,3 +944,61 @@ async def test_delayed_old_share_keeps_the_fresh_media_link_delivered_before_it(
     assert outcome is IngestionOutcome.ITEM_ALREADY_SAVED
     assert payload["media_url"] == FRESH_SIGNED_IMAGE_URL
     assert item.source_message_id == OTHER_MESSAGE_ID
+
+
+class QueueWhoseJobDecidesAtOnce(RecordingJobQueue):
+    """A chat worker that settles the route between queuing and the queued mark."""
+
+    def __init__(self, state: RedisIngestionState, message: ChatMessage) -> None:
+        super().__init__()
+        self._state = state
+        self._message = message
+
+    async def enqueue(self, job_name: str, job_id: str, arguments: Mapping[str, Any]) -> bool:
+        queued = await super().enqueue(job_name, job_id, arguments)
+        if job_name != ANSWER_CHAT_MESSAGE_JOB:
+            return queued
+        message = self._message
+        receipt = await self._state.text_receipt(
+            message.user_id, message.platform, message.message_id
+        )
+        assert receipt is not None
+        decided = receipt.model_copy(update={"route": TextRoute.COLLECTION_HINT})
+        await self._state.save_text_receipt(
+            message.user_id, message.platform, message.message_id, decided
+        )
+        return queued
+
+
+async def test_marking_the_job_queued_keeps_a_route_the_chat_worker_decided_meanwhile(
+    session_factory: async_sessionmaker[AsyncSession],
+    ingestion_state: RedisIngestionState,
+    user_id: uuid.UUID,
+) -> None:
+    hint = text_message(user_id)
+    ingestion = IngestionService(
+        session_factory,
+        QueueWhoseJobDecidesAtOnce(ingestion_state, hint),
+        ingestion_state,
+        HINT_WINDOW,
+    )
+    await ingestion.ingest_capture(reel_share(user_id))
+
+    await ingestion.ingest_chat_message(hint)
+
+    receipt = await receipt_of(ingestion_state, user_id)
+    assert (receipt.route, receipt.chat_queued) == (TextRoute.COLLECTION_HINT, True)
+
+
+async def test_a_button_tap_right_after_a_share_is_chat_with_no_share_to_decide_about(
+    ingestion: IngestionService,
+    ingestion_state: RedisIngestionState,
+    user_id: uuid.UUID,
+) -> None:
+    await ingestion.ingest_capture(reel_share(user_id))
+    tap = text_message(user_id).model_copy(update={"quick_reply_payload": "synthetic-payload"})
+
+    await ingestion.ingest_chat_message(tap)
+
+    receipt = await receipt_of(ingestion_state, user_id)
+    assert (receipt.route, receipt.saved_item_id) == (TextRoute.CHAT, None)
